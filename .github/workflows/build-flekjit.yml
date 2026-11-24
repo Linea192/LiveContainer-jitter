@@ -29,33 +29,50 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: recursive
+          fetch-depth: 0
 
       - name: Apply FlekJIT patches
         run: |
           set -eu
-          apply() { # patchfile, already-marker, restore-list
-            if grep -q "$2" LiveContainerSwiftUI/Views/Settings/LCSettingsView.swift 2>/dev/null \
-               && [ "$2" != "case BuiltIn = 7" ]; then
-              echo "$1: fork already patched — nothing to do"
-              return 0
-            fi
+          apply() { # patchfile, gate — "marker:file" (unique line this patch adds) or "file" (a file only this patch creates)
+            case "$2" in
+              *:*)
+                if grep -qF "${2%%:*}" "${2#*:}" 2>/dev/null; then
+                  echo "$1: already present in this fork — skipping"
+                  return 0
+                fi ;;
+              *)
+                if [ -e "$2" ]; then
+                  echo "$1: already present in this fork — skipping"
+                  return 0
+                fi ;;
+            esac
             if git apply --check "patches/$1" 2>/tmp/flekjit.err; then
               git apply --binary "patches/$1"
               echo "$1 applied"
-            elif git apply --binary --3way "patches/$1" >/dev/null 2>&1 || git apply --binary -C1 "patches/$1" 2>>/tmp/flekjit.err; then
-              echo "$1 applied via fallback flags"
+            elif git apply --binary --3way "patches/$1" 2>>/tmp/flekjit.err; then
+              echo "$1 applied via 3-way merge"
             else
               echo "::error::FATAL: $1 no longer applies — your fork's own commits likely shifted the hunk contexts. Restore the affected files and re-run:"
-              echo "  git checkout -- $3"
               cat /tmp/flekjit.err
               exit 1
             fi
           }
-          apply flekjit-core.patch "case BuiltIn = 7" "LiveContainer/ LiveContainerSwiftUI/"
-          apply flekjit-ui.patch "FlekBuiltInJITSection" "LiveContainerSwiftUI/ Resources/"
-          apply flekjit-vpn.patch "LCVPNConnection" "LiveContainer/ LoopbackVPN/"
-          apply flekjit-project.patch "name = StikJITHeadless" "LiveContainer.xcodeproj/"
+          apply flekjit-core.patch    "case BuiltIn = 7:LiveContainerSwiftUI/Views/Settings/LCSettingsView.swift"
+          apply flekjit-ui.patch      "LiveContainerSwiftUI/FlekDeckJIT/FlekJITSetup.swift"
+          apply flekjit-vpn.patch     "LiveContainerSwiftUI/FlekDeckJIT/FlekLoopbackVPN.swift"
+          apply flekjit-project.patch "StikJITHeadless:LiveContainer.xcodeproj/project.pbxproj"
           echo "all patches in"
+
+          # Guard 1: no conflict markers anywhere the patches touched.
+          if grep -rIl $'^<<<<<<< \|^>>>>>>> ' --exclude-dir=.git . ; then
+            echo "::error::conflict markers left in the tree — a 3-way merge went wrong"
+            exit 1
+          fi
+          # Guard 2: the project file must be a valid property list before
+          # xcodebuild ever opens it (a corrupted pbxproj is the classic
+          # 'not a valid property list' failure).
+          plutil -lint LiveContainer.xcodeproj/project.pbxproj
 
       - name: Prepare Dependencies
         run: sh .github/prepare_dependencies.sh
