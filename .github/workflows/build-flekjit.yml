@@ -1,0 +1,217 @@
+name: Build FlekJIT fork
+
+on:
+  workflow_dispatch:
+    inputs:
+      release__nightly:
+        description: Also publish a nightly release
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build using xcodebuild command
+    runs-on: xcode-27
+    env:
+      scheme: LiveContainer
+      archive_path: archive
+
+    steps:
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '27.2'
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Apply FlekJIT patches
+        run: |
+          set -eu
+          apply() { # patchfile, already-marker, restore-list
+            if grep -q "$2" LiveContainerSwiftUI/Views/Settings/LCSettingsView.swift 2>/dev/null \
+               && [ "$2" != "case BuiltIn = 7" ]; then
+              echo "$1: fork already patched — nothing to do"
+              return 0
+            fi
+            if git apply --check "patches/$1" 2>/tmp/flekjit.err; then
+              git apply --binary "patches/$1"
+              echo "$1 applied"
+            elif git apply --binary --3way "patches/$1" >/dev/null 2>&1 || git apply --binary -C1 "patches/$1" 2>>/tmp/flekjit.err; then
+              echo "$1 applied via fallback flags"
+            else
+              echo "::error::FATAL: $1 no longer applies — your fork's own commits likely shifted the hunk contexts. Restore the affected files and re-run:"
+              echo "  git checkout -- $3"
+              cat /tmp/flekjit.err
+              exit 1
+            fi
+          }
+          apply flekjit-core.patch "case BuiltIn = 7" "LiveContainer/ LiveContainerSwiftUI/"
+          apply flekjit-ui.patch "FlekBuiltInJITSection" "LiveContainerSwiftUI/ Resources/"
+          apply flekjit-vpn.patch "LCVPNConnection" "LiveContainer/ LoopbackVPN/"
+          apply flekjit-project.patch "name = StikJITHeadless" "LiveContainer.xcodeproj/"
+          echo "all patches in"
+
+      - name: Prepare Dependencies
+        run: sh .github/prepare_dependencies.sh
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -project LiveContainer.xcodeproj \
+            -sdk iphoneos -arch arm64 -configuration Release 2>&1 | tee build.log | tail -60
+          grep -q "ARCHIVE SUCCEEDED" build.log || { echo "::error::archive failed"; tail -120 build.log; exit 1; }
+
+      - name: Sign entitlement-bearing binaries (ldid)
+        run: |
+          set -eu
+          brew install ldid
+          APP="$archive_path.xcarchive/Products/Applications/LiveContainer.app"
+          [ -d "$APP" ] || { echo "::error::LiveContainer.app missing from archive"; exit 1; }
+          ldid -S".github/flekjit/entitlements-app.xml" "$APP/LiveContainer"
+          ldid -S".github/flekjit/entitlements-app.xml" "$APP/PlugIns/LiveProcess.appex/LiveProcess"
+          ldid -S".github/flekjit/entitlements-vpn.xml" "$APP/PlugIns/LoopbackVPN.appex/LoopbackVPN"
+          ldid -S".github/flekjit/entitlements-vpn.xml" "$APP/Frameworks/StikJITHeadless.framework/StikJITHeadless"
+          ldid -S"" "$APP/Frameworks/IdevicePairing.dylib"
+          for f in "$APP/LiveContainer" "$APP/PlugIns/LiveProcess.appex/LiveProcess"; do
+            ldid -e "$f" > /tmp/ent.plist
+            grep -q "application-groups" /tmp/ent.plist || { echo "::error::app groups missing on $f"; exit 1; }
+            grep -q "keychain-access-groups" /tmp/ent.plist || { echo "::error::keychain groups missing on $f"; exit 1; }
+          done
+          echo "entitlements verified (groups + 128 keychain groups)"
+
+      - name: Create plain IPA (LiveContainer-flekjit.ipa)
+        run: |
+          set -eu
+          cd "$archive_path.xcarchive/Products"
+          # Upstream packaging rule: the plain IPA ships without
+          # SideStoreSupport.framework — it is only useful in the +SideStore
+          # build, so park it in tmp/ and put it back afterwards.
+          rm -rf Payload tmp && mkdir Payload tmp
+          cp -R Applications/LiveContainer.app Payload/
+          if [ -d Payload/LiveContainer.app/Frameworks/SideStoreSupport.framework ]; then
+            mv Payload/LiveContainer.app/Frameworks/SideStoreSupport.framework tmp/
+          fi
+          find Payload -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
+          zip -qry LiveContainer-flekjit.ipa Payload -x "._*" ".DS_Store" "__MACOSX"
+          if [ -d tmp/SideStoreSupport.framework ]; then
+            mv tmp/SideStoreSupport.framework Payload/LiveContainer.app/Frameworks/
+          fi
+          echo "plain IPA: $(du -h LiveContainer-flekjit.ipa | cut -f1)"
+
+      - name: Create +SideStore IPA (SideStore embedded, self cert pull)
+        run: |
+          set -eu
+          cd "$archive_path.xcarchive/Products"
+          APP=Payload/LiveContainer.app
+          [ -d "$APP/Frameworks/SideStoreSupport.framework" ] || { echo "::error::SideStoreSupport.framework missing"; exit 1; }
+
+          # 1) App-Group + URL schemes + intents the embedded SideStore needs
+          /usr/libexec/PlistBuddy -c 'Add :ALTAppGroups array' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :ALTAppGroups:0 string group.com.SideStore.SideStore' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:1 dict' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:1:CFBundleURLName string com.kdt.livecontainer.sidestoreurlscheme' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:1:CFBundleURLSchemes array' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:1:CFBundleURLSchemes:0 string sidestore' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:2 dict' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:2:CFBundleURLName string com.kdt.livecontainer.sidestorebackupurlscheme' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:2:CFBundleURLSchemes array' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleURLTypes:2:CFBundleURLSchemes:0 string sidestore-com.kdt.livecontainer' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :INIntentsSupported array' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :INIntentsSupported:0 string RefreshAllIntent' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :INIntentsSupported:1 string ViewAppIntent' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :NSUserActivityTypes array' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :NSUserActivityTypes:0 string RefreshAllIntent' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :NSUserActivityTypes:1 string ViewAppIntent' "$APP/Info.plist"
+
+          # 2) Settings toggle: Open SideStore (LCBootstrap reads LCOpenSideStore)
+          python3 - <<'PY'
+          import plistlib
+          path = 'Payload/LiveContainer.app/Settings.bundle/Root.plist'
+          with open(path, 'rb') as f:
+              data = plistlib.load(f)
+          specs = data.setdefault('PreferenceSpecifiers', [])
+          if not any(s.get('Key') == 'LCOpenSideStore' for s in specs):
+              specs.append({'Type': 'PSToggleSwitchSpecifier', 'Title': 'Open SideStore',
+                            'Key': 'LCOpenSideStore', 'DefaultValue': False})
+          with open(path, 'wb') as f:
+              plistlib.dump(data, f)
+          PY
+
+          # 3) Fetch SideStore nightly + dylibify, embed as SideStoreApp.framework
+          curl -fL -o tmp/SideStore.ipa https://github.com/LiveContainer/SideStore/releases/download/nightly/SideStore.ipa
+          (cd tmp && unzip -q SideStore.ipa)
+          [ -d tmp/Payload/SideStore.app ] || { echo "::error::SideStore.ipa has no Payload/SideStore.app"; exit 1; }
+          mv tmp/Payload/SideStore.app "$APP/Frameworks/SideStoreApp.framework"
+          curl -fL -o tmp/dylibify https://github.com/LiveContainer/dylibify/releases/download/1.0/dylibify
+          chmod +x tmp/dylibify
+          ./tmp/dylibify "$APP/Frameworks/SideStoreApp.framework/SideStore" "$APP/Frameworks/SideStoreApp.framework/SideStore.dylib"
+          rm "$APP/Frameworks/SideStoreApp.framework/SideStore"
+          mv "$APP/Frameworks/SideStoreApp.framework/SideStore.dylib" "$APP/Frameworks/SideStoreApp.framework/SideStore"
+          ldid -S"" "$APP/Frameworks/SideStoreApp.framework/SideStore"
+          cp "$GITHUB_WORKSPACE/.github/sidelc/LCAppInfo.plist" "$APP/Frameworks/SideStoreApp.framework/"
+
+          # 4) Intent metadata for the host app
+          cp "$APP/Frameworks/SideStoreApp.framework/Intents.intentdefinition" "$APP/"
+          cp "$APP/Frameworks/SideStoreApp.framework/ViewApp.intentdefinition" "$APP/"
+          cp -R "$APP/Frameworks/SideStoreApp.framework/Metadata.appintents" "$APP/Metadata.appintents"
+          sed -i '' 's/9SideStore20RefreshAllAppsIntentV/16SideStoreSupport20RefreshAllAppsIntentV/g' "$APP/Metadata.appintents/extract.actionsdata"
+          sed -i '' 's/9SideStore26RefreshAllAppsWidgetIntentV/16SideStoreSupport26RefreshAllAppsWidgetIntentV/g' "$APP/Metadata.appintents/extract.actionsdata"
+
+          # 5) Widget extension: AltWidget -> LiveWidget
+          mv "$APP/Frameworks/SideStoreApp.framework/PlugIns/AltWidgetExtension.appex" "$APP/PlugIns/LiveWidgetExtension.appex"
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.kdt.livecontainer.LiveWidget' "$APP/PlugIns/LiveWidgetExtension.appex/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable LiveWidgetExtension' "$APP/PlugIns/LiveWidgetExtension.appex/Info.plist"
+          mv "$APP/PlugIns/LiveWidgetExtension.appex/AltWidgetExtension" "$APP/PlugIns/LiveWidgetExtension.appex/LiveWidgetExtension"
+          ldid -S"$GITHUB_WORKSPACE/.github/sidelc/LiveWidgetExtension_adhoc.xml" "$APP/PlugIns/LiveWidgetExtension.appex/LiveWidgetExtension"
+
+          # 6) Strip old signatures and package
+          find Payload -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
+          zip -qry LiveContainer-flekjit+SideStore.ipa Payload -x "._*" ".DS_Store" "__MACOSX"
+          echo "+SideStore IPA: $(du -h LiveContainer-flekjit+SideStore.ipa | cut -f1)"
+
+      - name: Upload plain IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainer-flekjit.ipa
+          path: ${{ env.archive_path }}.xcarchive/Products/LiveContainer-flekjit.ipa
+
+      - name: Upload +SideStore IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainer-flekjit+SideStore.ipa
+          path: ${{ env.archive_path }}.xcarchive/Products/LiveContainer-flekjit+SideStore.ipa
+
+  release__nightly:
+    name: Nightly Release
+    permissions:
+      contents: write
+    if: inputs.release__nightly == true
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Download plain IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: LiveContainer-flekjit.ipa
+      - name: Download +SideStore IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: LiveContainer-flekjit+SideStore.ipa
+      - name: Nightly Release
+        uses: andelf/nightly-release@5834076edc55cc05975561c9722043f072ac5c26
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          body: |
+            **Commit:** ${{ github.sha }}
+            LiveContainer + FlekJIT (built-in JIT enabler) nightly.
+            Two IPAs: plain, and +SideStore (SideStore embedded — pulls free certs by itself).
+          files: |
+            LiveContainer-flekjit.ipa
+            LiveContainer-flekjit+SideStore.ipa
