@@ -1,3 +1,421 @@
+FlekDeck v0.3.0 Workflow Setup
+Loading...
+Fix error: 3s
+11s
+Run set -o pipefail
+Command line invocation:
+    /Applications/Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild archive -archivePath archive -scheme LiveContainer -project LiveContainer.xcodeproj -sdk iphoneos -arch arm64 -configuration Release
+
+Build settings from command line:
+    ARCHS = arm64
+    SDKROOT = iphoneos27.2
+
+2026-11-24 09:12:51.546 xcodebuild[14086:39205] Error Domain=NSCocoaErrorDomain Code=3840 "JSON text did not start with array or object and option to allow fragments not set. around line 1, column 0." UserInfo={NSDebugDescription=JSON text did not start with array or object and option to allow fragments not set. around line 1, column 0., NSJSONSerializationErrorIndex=0}
+2026-11-24 09:12:51.565 xcodebuild[14086:39205] Writing error result bundle to /var/folders/5n/5t77mfb93jd7q8v9s6f0dn0m0000gn/T/ResultBundle_2026-24-11_09-12-0051.xcresult
+xcodebuild: error: Unable to read project 'LiveContainer.xcodeproj'.
+	Reason: The project “LiveContainer” is not a valid property list, and cannot be opened.
+
+
+	Examine “/Users/runner/work/LiveContainer-jitter/LiveContainer-jitter/LiveContainer.xcodeproj” for invalid content or unresolved source control conflicts.
+Error: Process completed with exit code 74. Show full message
+
+Thought Process
+Looking at your log: the build never even started — xcodebuild died while trying to open the project. Let me build the fix.
+The failure is in the Archive step — project.pbxproj got corrupted before xcodebuild ran, and I can see exactly how my workflow lets that happen: the patch fallback chain (--3way → -C1) can leave conflict markers in the tree when the first fallback fails, and the second attempt can then "succeed" on the dirty file. Let me confirm the trigger and rebuild that step properly.
+
+The build log tells the story: the patch step "succeeded" but left project.pbxproj unparseable, and xcodebuild died opening the project (not a valid property list — the classic signature of conflict markers or a misapplied hunk). I have a specific suspect: my fallback chain --3way → -C1 can silently corrupt — a failed --3way can leave <<<<<<< markers, then -C1 (1-line context) "succeeds" on the marker-laden file and exits 0. Let me set up the plan and reproduce it locally before fixing.
+
+
+Thought Process
+Patches confirmed: the project patch carries binary hunks (xcframework + dylib) and rewrites project.pbxproj; the vpn patch adds FlekLoopbackVPN.swift. Upstream main still equals our pinned b0f53e8, so the drift in the user's fork comes from their own commits. Now let me pin down the exact corruption path — first, check how the gate markers sit inside the patches (addition vs. context):
+
+The log shows the patch step exited 0 ("all patches in") yet project.pbxproj reached xcodebuild unparseable — and xcodebuild's own hint ("unresolved source control conflicts") points at conflict markers. I have several suspects in my fallback chain (the >/dev/null 2>&1 on --3way, the -C1 retry, and gates that grep the wrong file for two of the patches). Time to stop theorizing and reproduce all plausible fork layouts empirically:
+
+The reproduction exposed two real bugs already, even before the plist issue:
+
+UI patch silently skipped on a pristine fork: after core applies, LCSettingsView.swift contains FlekBuiltInJITSection (core adds the reference), so the ui gate grep FlekBuiltInJITSection LCSettingsView.swift fires "already patched" — the 12 new UI files never get created.
+project double-applies on an already-patched fork via the fallback flags and still exits 0.
+But neither directly explains "not a valid property list" — that's a parse failure. The patch applied cleanly in my sims, so if the result is an invalid plist, the bug is in the pbxproj content my ruby generator produced. Let me validate the actual applied pbxproj with a real parser:
+
+Both files are byte-identical — so whatever the sim applied equals the work-tree pbxproj the kit patch produces. That means if that file is an invalid plist, a perfectly clean patch application still produces exactly the user's error. No Xcode exists here to check, but a real OpenStep plist parser does. This is the decisive test:
+
+The parser API is ParseFromFile — fixing the checker and running the decisive test. Quick status meanwhile: I've confirmed the corruption path isn't conflict markers (my scanner shows braces balanced, no markers); the suspicion is now firmly on the pbxproj my ruby generator wrote being an invalid plist by construction.
+
+The plist check just proved something important: the kit's pbxproj output is a valid plist (212 objects parse cleanly). So the user's corruption came from how the patch step interacted with their fork's state. My repro already exposed the systemic bugs (ui patch never applies on any fork — its gate false-fires after core applies; vpn/project gates grep a file their markers never live in). Now let me prove the exact silent-corruption path — the -C1 fallback — with a properly shallow clone (my earlier --depth was silently ignored on local clones) and check the already-patched layout's pbxproj validity too:
+
+There it is — the root cause. The project patch's first hunk replaces the OpenStep plist header line // !$*UTF8*$! with a corrupted 3-line fragment:
+
+text
+-// !$*UTF8*$!
++// !$*UTF8*$ +				E15C6F2F30440EAD00FEC6BD /* StikJITHeadless.framework in Embed Frameworks */,
++!
+That is garbage — it looks like the ruby generator's output got scrambled across a line boundary, leaving both a broken header and an orphaned object ID at the top of the file. Wait — but the parse test just said upA/upD were VALID with 212 objects... let me check what the applied file actually contains at line 1 vs what upstream has, because something doesn't add up:
+
+So the applied file does contain the corrupted header (line 2-4: a truncated marker, the orphaned object line, a stray !) — the OpenStep parser is just more permissive than Xcode's plist reader (it parsed 212 objects because the trash lines sit inside the top-level braces before {, so it skipped them). But xcodebuild's plist parser is strict — that's exactly why it throws "not a valid property list".
+
+The OpenStep parser being permissive actually explains the earlier VALID results. Xcode is strict. So the real fix is two-fold:
+
+Fix the patch itself: rebuild flekjit-project.patch so the first hunk is a clean modification of the plist header region. No that's backwards — the first hunk should be removed entirely; the header shouldn't be touched at all. The E15C6F2F... line belongs in the Embed-Frameworks build phase, hundreds of lines later, not at the top of the file.
+Fix the workflow: correct gates so each patch's already-applied marker greps the file that patch's marker actually lives in, drop the dangerous -C1 fallback, and add a strict plist validity gate right after patching (plutil -lint on macOS runners), plus fetch-depth: 0 so --3way has blob data available.
+But wait — I need to find how the corruption got into the patch in the first place. The kit's project patch was generated by a ruby xcodeproj script in lc-port-work/tree. Let me look at what the work tree contains now, and how the patch was cut:
+
+The work tree itself carries the corrupted header — so the patch faithfully shipped a broken pbxproj from the start. The orphaned line 2 is actually the Embed Frameworks files-list entry that belongs ~500 lines deeper. Let me see how the generator produced this and what the full picture is:
+
+The service was updated while this task was running, so it was interrupted. Please send your request again.
+Finish it 
+
+Thought Process
+Continuing — picking up exactly where I left off: root cause is confirmed (the kit's flekjit-project.patch itself ships a corrupted pbxproj header, cut from a work tree that a find() returning -1 silently scrambled). Now I'll verify the collateral damage, rebuild the patch, fix the workflow gates, and re-validate everything.
+
+The mechanism is now proven. Look at the pristine phase bytes: files = ( sits at three tabs (^I^I^Ifiles = (), but the generator at build_lc_flekjit_port.py:893 searches for four tabs — pb.find('\t\t\t\tfiles = (', frmk_i) → -1, and with no assert, the slice arithmetic pb[:12] + insertion + pb[12:] spliced the embed entry straight into the middle of the // !$*UTF8*$! magic header. Exactly the corrupted bytes we see. And the work tree confirms the collateral: E15C6F2F appears only at line 2 (orphan) and line 14 (PBXBuildFile object) — it never landed in the Embed Frameworks phase's files list, so the framework embed is functionally missing too.
+
+Let me audit the rest of the generator's project section and the actual workflow gates before repairing:
+
+The generator's insertion arithmetic is now confirmed to the byte: files_i = -1, and pb[:12] + insertion + pb[12:] spliced the embed entry into the middle of // !$*UTF8*$! — producing exactly the corrupted 4-line header we see. All other insertions landed. But I also spotted a second latent bug while reading: F1EC0DE1305600000A000009 is used both as the LoopbackVPN Debug config (line 1039) and as the LoopbackVPN.appex build file (line 905) — a duplicate object ID that would break Xcode even after the header is fixed. Let me audit the whole object graph before repairing:
+
+Now I have the full picture of the generator's project section. Before repairing, let me audit the object graph for the suspected duplicate ID (F1EC0DE1305600000A000009 used as both appex build-file and Debug config) and any other collisions or dangling refs:
+
+Audit confirms three concrete defects in the shipped project patch, all now proven to the character:
+
+Corrupt header — splice at index 12 (-1 + 13) split // !$*UTF8*$! mid-marker
+Duplicate object ID F1EC0DE1305600000A000009 — appex build-file and LoopbackVPN Debug config
+Embed entry missing from its phase — it's the orphan at line 2
+Now let me see how the workflow currently feeds patches (embedded vs. files) before I rebuild everything:
+
+The workflow is fully mapped. Now executing the repair. First, verify the work tree's uncommitted state won't contaminate an amend, and pick a collision-free object ID for the duplicate:
+
+Two things to resolve before the repair commit: (1) F1EC0DE1305600000A00000D already exists in the FlekDeck source project, so I need a truly fresh ID; (2) the work tree shows 295 modified files — I must understand what those diffs are before committing anything on top:
+
+The 295 "modifications" are all file-mode flips only (100644→100755, zero content changes) — noise from the copy process that I must keep out of the rebuilt patch. F1EC0DE1305600000A00000E is free in all three projects. Now the critical check: is the committed project patch already polluted with mode flips, and what exactly does the current HEAD commit contain?
+
+HEAD commit is clean (20 files, 5053 insertions — no mode noise in the shipped patch; the 295 mode flips are uncommitted working-tree noise I'll exclude with core.fileMode false). Updating the plan, then executing the repair:
+
+The regex used four tabs but the phase's files = ( sits at three tabs (as the earlier cat -A showed). Fixing the anchor:
+
+The phase-list reference uses five tabs? Let me check the actual indentation of that reference inside the Embed App Extensions phase:
+
+Four tabs, not five — my generator had emitted that reference with five tabs (one of the indentation inconsistencies I'm glad to see go). Fixing:
+
+The remaining two occurrences are the Debug config definition + its configList reference (lines 1200, 2152) — those are supposed to keep the old ID. My sanity assertion was wrong, not the file (which wasn't written — the assert fired first). Fixing the check:
+
+The repair itself succeeded — pbxproj written (−1 char: the orphan line moved to its phase), HEAD amended, patch re-cut. Only my final self-check looked at the wrong section: it grabbed the first @@ of the whole patch, which belongs to IdevicePairing/README.md, not the pbxproj. Let me make the script idempotent (so re-running validates instead of crashing) and aim the check at the pbxproj section:
+
+Right — the previous run already amended HEAD; the file is clean now, so there's nothing to stage. Making the git step conditional:
+
+Repair verified complete: header restored, 212 unique object IDs, no dangling refs, embed entry inside its phase, and the re-cut patch's first pbxproj hunk is now a clean section insertion (the python3 interpreter just lacks the venv's openstep_parser — python has it; I'll use that below). Now the workflow fix. First, verify each gate marker lives in exactly one patch:
+
+All four markers are unique to their patch. Now rewriting the workflow's patch step with the sound design: per-patch gates on a file each patch itself creates, no -C1, --3way with visible stderr, a conflict-marker sweep, and a plutil -lint gate on the pbxproj before xcodebuild ever sees it:
+
+Workflow validates. Now the acid test — re-run the four-layout simulation with the fixed patch and fixed apply chain, including the previously-fatal drifted+shallow case:
+
+Two sim bugs of mine (not of the fix): (1) core's gate file LCSettingsView.swift exists in pristine upstream — core modifies it, doesn't create it, so the gate false-fires and skips core on pristine forks, cascading into ui's failure; I need a file that core itself creates. (2) The sim used python3 but the venv parser lives under python. Let me find core's created files:
+
+Core creates no files — it only modifies existing ones — so no file-existence gate can ever work for core; the right gate for core is its unique marker line case BuiltIn = 7 inside LCSettingsView.swift (that was the old gate's one correct call — but it was coupled with the broken exclusion for the others). So the design: core = marker-in-file gate (marker unique to core); ui/vpn/project = file-existence gates (each creates FlekDeckJIT/FlekJITSetup.swift, FlekLoopbackVPN.swift, StikJITHeadless/StikJITHeadless.swift). But the sim revealed one more layer: ui's LCAppListView.swift hunk context at line 1079 expects FlekJITSetup symbols that core adds — so the ui patch is order-dependent on core. The gate design must guarantee core lands before ui. Marker gate does that.
+
+One more thing to verify — that ui's hunk into LCAppListView.swift expects symbols core adds (my reading of @State private var connectionWatch: FlekJITSetup.ConnectionWatch?). If ui truly depends on core symbols in its context lines, then even on a drifted fork the ui patch would need core applied first. Marker gate for core enforces that order. Good.
+
+Now let me fix the sim's two bugs and re-run:
+
+All five layouts now behave exactly right (apply cleanly on pristine/drifted/shallow; all-skip on the ported fork). Only the sim's final plist-check heredoc still hits an interpreter mismatch — let me resolve which python has the parser and wire it in explicitly:
+
+Parser restored (the earlier install was lost when the sandbox recycled). Rather than re-running the whole sim, let me run the final plist validation directly on the five sim trees:
+
+My shell quoting scrambled the path ($SIM didn't expand inside the single-quoted python). Headers are all // !$*UTF8*$!|{ — the real proof — and zero conflict markers. Now the parser check with a proper script file:
+
+That upC/upG parse error is an artifact of my own sim harness, not the patches: I injected "drift" comments into the pbxproj inside a files = ( list (ntainerShared; … then comments, then };) — comments can't appear there, so the parser chokes on my synthetic drift, which the real workflow would never see. (Note upA/upB/upD/upG all pass with the repaired patch at 213 objects.) But the exercise exposed something real I should sanity-check: that the drifted-fork 3-way path truly lands the same tree as the direct path. Let me redo the drift properly — as an edit inside an object's values, not inside a files list:
+
+upI exposed the last trap: shallow clone + drift → git apply --3way needs blob f44e259 (the pbxproj preimage) but a shallow clone lacks it → hard fatal. The workflow's fetch-depth: 0 fix handles this — and I see why core's marker gate "skipped" in upH/upI: my sim copied patches/ inside the repo before the drift commit, so the drift commit included patches/ — a sim artifact. But the fundamental finding stands and is now proven across all seven layouts: the fixed chain is correct, and the drifted+shallow case fails loudly with a clear message (and is fixed by fetch-depth: 0). Final comprehensive sim, this time clean:
+
+ALL-OK — but with an important caveat I must be honest about: in this final sim all applies went direct (the DEVELOPMENT_TEAM drift doesn't overlap any hunk context), so the 3-way path and its shallow-clone failure mode weren't exercised here. I have evidence of the shallow failure from the earlier (polluted) run, but let me prove it cleanly with an overlapping drift — the case where 3-way is actually required:
+
+Two problems in that run: my heredoc quoting broke (echo "all patches in missing close quote), and — more concerning — J/K inherited patches/ from cp -R A (A was patched in the final sim run earlier) — the marker gate saw the core patch already applied and skipped everything. The pbxproj showed 214 objects because it still has the drift line, unpatched. Let me redo this properly as a script file:
+
+Now the full behavior is mapped, including the case I couldn't reach before. The overlapping-drift test proves the fix works end-to-end:
+
+J (drifted, full history): project patch fails direct apply → --3way merges, keeps the user's UserOwn.framework line, but leaves <<<<<<< ours conflict markers → my workflow's Guard 1 (conflict-marker sweep) catches it and fails loudly (parser confirms INVALID).
+K (drifted, shallow): fails direct, fails 3-way ("repository lacks the necessary blob"), exits 1 without writing anything — the tree stays clean (parser: VALID 187 objects, port absent), and fetch-depth: 0 in the workflow removes this failure mode entirely.
+So the final design is proven across every fork state:
+
+Pristine/drifted-with-full-history → direct or 3-way merge
+Conflicted 3-way → loud abort via marker sweep (never reaches xcodebuild)
+Already-ported → all four skip
+Shallow+conflict → loud abort with clear error (cured by fetch-depth: 0)
+Updating todos, then shipping: sync the kit's workflow copy, re-zip, fix README, regenerate the guide:
+
+Now re-zip the kit with the repaired patch and updated workflow, and verify the zip contents match:
+
+Zip verified: 41 files, repaired patch (first pbx hunk @@ -7,6 +7,10 @@ — the header region is untouched now), fixed workflow, no mode noise. Now the guide document. Let me look at its current CI section to update the patch-step description:
+
+The PDF is stale (09:07, older than the new docx). The generator only writes docx — let me check how the PDF was produced before and regenerate it:
+
+PDF comes from soffice conversion (as the checker script implies). Converting, then running the full verification chain:
+
+Structure verified (17 headings, 5 tables, no placeholders). Now the required visual check — render the PDF pages and inspect:
+
+All pages have healthy content density (no blanks). Since I can't view images in this session, let me run the text-level PDF checker (which verifies the rendered text content — the pages' actual substance) as the visual-check substitute:
+
+One wording check "failed" only because pdftotext wrapped a line — the gate text is present and correct in the PDF. But writing the recovery steps for the user's fork made me re-examine the guide's setup flow vs my new gates, and I spotted a real conflict I must resolve: the guide's step 3 tells users to move vendored/StikJITHeadless to the repo root — if followed, my file-existence gate for the project patch would skip it (and the patch itself would hit "already exists" anyway). Let me read the guide's actual setup section:
+
+Now I must fix a trap my new gate design just exposed: the guide's step 3 tells users to move vendored/StikJITHeadless to the repo root and commit — if they do, my file-existence gate for the project patch would skip it and silently produce a framework-less IPA. Worse, that instruction was already broken under the old kit (the patch's file-adds would collide: "already exists in working directory"). The correct gate for the project patch is a marker in the pbxproj itself — it fires only when the project file already carries the targets. Fixing the workflow, then the guide instructions:
+
+Right — the workflow I wrote earlier used a different gate format (plain file-existence, apply flekjit-project.patch "StikJITHeadless/StikJITHeadless.swift" with the case only handling *:* vs *). Let me check what's actually in the file:
+
+Now I can fix it properly — the workflow needs the marker:file gate form (core and project both gate on marker lines, not file existence), and the guide's step 3 must be reworded to not fight the gates:
+
+Now verify the new project-patch gate marker (StikJITHeadless) is absent from pristine upstream's pbxproj, and validate the workflow again:
+
+Now the deeper consistency issue I flagged: the guide/README tell users to commit vendored/StikJITHeadless and vendored/IdevicePairing at the repo root — but the project patch itself creates those exact files, so git apply would die with "already exists in working directory". Let me verify what the patch actually adds, then make the workflow handle both layouts:
+
+The kit's vendored copy has 3 files the patch's new-file list doesn't show (the Mach-O StikJIT, swiftdoc, IdevicePairing.dylib) — yet the patch has 3 GIT binary patch sections. I need to know exactly which files those binary hunks carry before finalizing the setup instructions:
+
+The design tension is now clear, and it's the last thing to verify empirically: the kit supports two setup layouts — README's (leave vendored/ as-is; the patch creates root dirs) and the guide's step 3 (move vendored to root and commit; patch must no-op on identical files). My chain keeps --3way, which should merge identical new-files as clean no-ops. Testing exactly that:
+
+Both layouts verified end-to-end: L1 direct-apply, L2 3-way merges the identical new-files as no-ops — valid pbxproj, all binaries present, no markers. Now sync the kit copy, fix the guide's two now-stale wordings (the project gate description and step 3's "pure text" claim), and regenerate:
+
+Everything regenerated and the zip carries all four fixed markers. Final verification pass — PDF text checks plus one last full-chain run on the exact repair-verification layout (pristine clone + L2-style vendored):
+
+fetch-depth: 0 is present — pdftotext just wrapped it across a line break, so the string check false-failed. All 9 wording checks actually pass. Now the last end-to-end sanity run of the complete final chain (both layouts, fresh clones), and the final audit of the user's fork-recovery path:
+
+All green. The task is complete — updating the todo list and wrapping up:
+
+Fixed, verified, and shipped. Here's the full picture:
+
+Root cause (three real defects, all in the shipped kit)
+1. flekjit-project.patch shipped a corrupted project.pbxproj. My patch generator searched for the Embed-Frameworks files = ( line with the wrong indentation (find() → -1, no assert), then spliced the embed entry at index 12 — the middle of the // !$*UTF8*$! magic header. Every "clean" application of the patch produced a pbxproj whose first lines were garbage — exactly what xcodebuild reports as "The project 'LiveContainer' is not a valid property list". Two more latent bugs rode along: a duplicate object ID (F1EC0DE1305600000A000009 used as both a build-file and the LoopbackVPN Debug config) and the embed entry never landing in its phase.
+
+2. The workflow's already-patched gates were broken. They grepped LCSettingsView.swift for all four patches' markers — but core adds FlekBuiltInJITSection to that file as part of its own hunk, so the ui patch was silently skipped on every pristine fork, and the vpn/project gates checked files their markers never appear in.
+
+3. The -C1 fallback could mask corruption. A failed --3way (swallowed by >/dev/null) followed by -C1 could exit 0 on a marker-laden tree — silent corruption instead of a loud failure.
+
+What I fixed
+Rebuilt the project patch — repaired the work-tree pbxproj (header restored, embed entry relocated into its phase, duplicate ID re-issued to ...000E), amended the commit, re-cut the patch. Graph audit: 212 unique object IDs, zero dangling refs, valid OpenStep plist.
+Rewrote the apply chain: core+project gate on marker lines only they add (case BuiltIn = 7, StikJITHeadless in the pbxproj); ui/vpn gate on files they create. No -C1. --3way with visible stderr. fetch-depth: 0 so the merge always has its blobs. Plus two guards before anything touches the tree: a conflict-marker sweep and plutil -lint project.pbxproj.
+Verified across 9 fork scenarios (pristine/drifted/shallow/overlapping-drift/already-ported/both vendored layouts): every path now yields either a clean valid pbxproj or a loud, actionable failure.
+To fix your LiveContainer-jitter fork
+Your fork already carries the corrupted patch result, so on your machine:
+
+Grab the new kit: lc-flekjit-kit.zip (or build-flekjit.yml standalone).
+Restore the corrupted files to pristine upstream in your fork:
+sh
+git checkout upstream/main -- LiveContainer.xcodeproj IdevicePairing StikJITHeadless
+(or git revert your ported commit if the fork has one), then commit the new patches/ + workflow and re-run Actions → Build FlekJIT fork. If you'd moved vendored/ to the root, that layout now also applies cleanly via 3-way no-op — no need to undo it.
+Updated deliverables: LiveContainer-FlekJIT-Fork-Guide.docx / .pdf (CI section, Upgrading and Troubleshooting rewritten to match the new chain), and the kit's README. The verification scripts (sim_layouts.sh, repair_project_patch.py, audit_pb_graph.py etc.) are under scripts/ if you want to re-run any of it.
+
+Generated files
+6
+File
+build-flekjit
+· yml
+File
+lc-flekjit-kit
+· zip
+PDF
+LiveContainer-FlekJIT-Fork-Guide
+· pdf
+Word
+LiveContainer-FlekJIT-Fork-Guide
+· docx
+File
+build-flekjit
+· yml
+File
+flekjit-project
+· patch
+error : applyi flekjit patches :0s
+Run set -eu
+patches/flekjit-core.patch:168: trailing whitespace.
+    
+patches/flekjit-core.patch:192: trailing whitespace.
+    
+warning: 2 lines add whitespace errors.
+flekjit-core.patch applied
+flekjit-ui.patch applied
+patches/flekjit-vpn.patch:51: trailing whitespace.
+    
+warning: 1 line adds whitespace errors.
+flekjit-vpn.patch applied
+patches/flekjit-project.patch:19569: trailing whitespace.
+#  define SWIFT_CLASS_PROPERTY(...) 
+patches/flekjit-project.patch:19576: trailing whitespace.
+#  define SWIFT_RUNTIME_NAME(X) 
+patches/flekjit-project.patch:19583: trailing whitespace.
+#  define SWIFT_COMPILE_NAME(X) 
+patches/flekjit-project.patch:19590: trailing whitespace.
+#  define SWIFT_METHOD_FAMILY(X) 
+patches/flekjit-project.patch:19597: trailing whitespace.
+#  define SWIFT_NOESCAPE 
+warning: squelched 42 whitespace errors
+warning: 47 lines add whitespace errors.
+flekjit-project.patch applied
+all patches in
+LiveContainer.xcodeproj/project.pbxproj: (Unexpected character / at line 1)
+Error: Process completed with exit code 1. Show full message
+您的账户已达到速率限制，请您控制请求频率
+error : applyi flekjit patches :0s
+Run set -eu
+patches/flekjit-core.patch:168: trailing whitespace.
+    
+patches/flekjit-core.patch:192: trailing whitespace.
+    
+warning: 2 lines add whitespace errors.
+flekjit-core.patch applied
+flekjit-ui.patch applied
+patches/flekjit-vpn.patch:51: trailing whitespace.
+    
+warning: 1 line adds whitespace errors.
+flekjit-vpn.patch applied
+patches/flekjit-project.patch:19569: trailing whitespace.
+#  define SWIFT_CLASS_PROPERTY(...) 
+patches/flekjit-project.patch:19576: trailing whitespace.
+#  define SWIFT_RUNTIME_NAME(X) 
+patches/flekjit-project.patch:19583: trailing whitespace.
+#  define SWIFT_COMPILE_NAME(X) 
+patches/flekjit-project.patch:19590: trailing whitespace.
+#  define SWIFT_METHOD_FAMILY(X) 
+patches/flekjit-project.patch:19597: trailing whitespace.
+#  define SWIFT_NOESCAPE 
+warning: squelched 42 whitespace errors
+warning: 47 lines add whitespace errors.
+flekjit-project.patch applied
+all patches in
+LiveContainer.xcodeproj/project.pbxproj: (Unexpected character / at line 1)
+Error: Process completed with exit code 1. Show full message
+您的账户已达到速率限制，请您控制请求频率
+error : applyi flekjit patches :0s
+Run set -eu
+patches/flekjit-core.patch:168: trailing whitespace.
+    
+patches/flekjit-core.patch:192: trailing whitespace.
+    
+warning: 2 lines add whitespace errors.
+flekjit-core.patch applied
+flekjit-ui.patch applied
+patches/flekjit-vpn.patch:51: trailing whitespace.
+    
+warning: 1 line adds whitespace errors.
+flekjit-vpn.patch applied
+patches/flekjit-project.patch:19569: trailing whitespace.
+#  define SWIFT_CLASS_PROPERTY(...) 
+patches/flekjit-project.patch:19576: trailing whitespace.
+#  define SWIFT_RUNTIME_NAME(X) 
+patches/flekjit-project.patch:19583: trailing whitespace.
+#  define SWIFT_COMPILE_NAME(X) 
+patches/flekjit-project.patch:19590: trailing whitespace.
+#  define SWIFT_METHOD_FAMILY(X) 
+patches/flekjit-project.patch:19597: trailing whitespace.
+#  define SWIFT_NOESCAPE 
+warning: squelched 42 whitespace errors
+warning: 47 lines add whitespace errors.
+flekjit-project.patch applied
+all patches in
+LiveContainer.xcodeproj/project.pbxproj: (Unexpected character / at line 1)
+Error: Process completed with exit code 1. Show full message
+
+Thought Process
+我来继续完成这个修复。先盘点沙箱里生成器、补丁和 workflow 的当前状态，然后修生成器 → 重建补丁 → 仿真验证 → 更新交付物。
+
+现在让我来确认关键问题：用户最近一次失败的 CI 运行，使用的是旧的损坏的补丁 (old corrupted patch) 还是新重建的补丁 (newly rebuilt patch)。行号将是证据。
+
+行号在这里是确凿的证据——用户日志中的警告位于 19569/19576/19583…，但我修复后的补丁在 19568/19575/19582… 出现了相同的尾随空格行。相差一行，这意味着要么是 Git 的错误报告计数方式不同，要么是用户的 fork 分支运行的补丁并非我当前提供的这个。让我阅读一下 workflow 的 apply 步骤，并运行决定性的实验：将该补丁应用到一个 pristine 的 checkout 上，并捕获 Git 具体报告的内容。
+
+工作流网关完全按照设计运行了——LiveContainer.xcodeproj/project.pbxproj: (Unexpected character / at line 1) 是新的 plutil -lint guard 在 xcodebuild 运行前拦截了损坏的 pbxproj（退出代码为 1，而不是 xcodebuild 的 74）。但行号证明该 fork 运行的是旧的、损坏的 project patch：用户日志在 19569/19576/19583 行报告了尾随空格（trailing whitespace），而我重建的补丁中相同的行位于 19568/19575/19582 行——正好偏差了一行，这是旧的 hunk-1 header-mangling hunk（+2 行）与丢失的 embed entry（-1）特征。Core (168/192) 和 vpn (51) 完全匹配，因此只有 flekjit-project.patch 过时了。让我对照 git 历史记录证明这一点，并重新验证当前的 kit。
+
+工作流门控完全按设计工作——但行号暴露了关键问题。用户的日志显示在 19569/19576/19583 行存在尾随空格警告，而我修复后的补丁在 19568/19575/19582 行有这些行（正好偏移了一行），并且在他们的运行中是 47 行空白字符错误，而我当前的补丁中应该是 88 行。他们的 fork 正在应用一个旧的、损坏的 flekjit-project.patch——修复后的版本还没有同步到他们的 fork。让我从 git 历史记录和 flekjit-fork-kit 目录中定位那个旧补丁，以确认损坏特征。
+
+HEAD 已经包含了修复后的补丁（md5 相同）。现在进行决定性的检查：从 git 历史中恢复旧的、损坏的补丁，并确认用户的日志特征（SWIFT 行在 19569，47 个空格错误）与之匹配——以证明他们的 fork 运行的是过时的补丁，而不是当前的补丁。
+
+旧损坏的补丁（来自修正前的中间提交，md5 为 461bfc…）其 SWIFT_CLASS_PROPERTY 尾随空格行恰好位于 19569 —— 这与用户的 CI 日志完全匹配。修复后的补丁则位于 19568。现在让我准确重现用户的错误日志，以一劳永逸地证明该 fork 运行的是哪个补丁，并确认修复后的补丁能够顺利通过相同的测试。首先，让我看看现有的复现脚本。
+
+完美——已经有一个完整的模拟框架（harness）了。现在进行决定性的测试：在原始克隆（pristine clone）上，对用户日志中显示的确切序列（依次应用 core→ui→vpn→project）进行复现。用户日志中的 warning: squelched 42 whitespace errors / warning: 47 lines add whitespace errors —— 注意是 47，而不是 88。Git 仅在实际应用的行上报告空白字符（whitespace）警告，且 warning: squelched N whitespace errors 出现在 git apply 结束时。让我针对这两种补丁运行此操作，并捕获 git 报告的确切输出。
+
+确凿的证据已确认。 用户的日志与旧的损坏补丁完全匹配（包括所有五个行号：19569/19576/19583/19590/19597，且 pbxproj 第 1 行 = // !$*UTF8*$），而修复后的补丁应用后得到了正确的头部 // !$*UTF8*$!。他们的分支运行了新的工作流（plutil 验证拦截了它——这就是为什么退出码是 1 而不是 xcodebuild 的 74），但仍然提交着旧的、已损坏的 flekjit-project.patch。
+
+用户将这些空格警告误认为是错误本身——它们其实只是外观上的问题（原生的 Xcode 头文件带有尾随空格）。让我也在工作流中使用 --whitespace=nowarn 将它们屏蔽掉，然后重新验证所有内容。首先，修复解析器检查并找到 openstep_parser：
+
+沙箱已重置——之前的 pip 包丢失了。重新安装并完成验证：
+
+两个 pbxproj 文件都可以被宽松的 Python 解析器解析（这就是为什么旧的漏洞 initially 溜过了验证），但 fixed 补丁的 pbxproj 有 213 个对象，且 embed 条目已正确放置，而损坏的那个则缺少一个对象（212 个），并且第 1 行损坏了 —— plutil/xcodebuild 会拒绝它。现在让我确认一下到底哪些文件与用户的旧 kit 不同，检查旧补丁中损坏的 hunk，并查看 kit 中 README 的 Upgrading 部分：
+
+诊断已得到证实。旧的损坏补丁的第一个 hunk 显示了完全的损坏：@@ -1,4 +1,6 @@ 将 // !$*UTF8*$! 拆分成了三行垃圾数据——这就是 plutil 所拒绝的 Unexpected character / at line 1。修复后的补丁不再触及第 1 行。
+
+一个额外的问题：用户的日志将约 47 行尾随空格的警告（来自 Xcode 生成的 StikJIT-Swift.h 头文件的纯外观问题）与真正的错误混淆了。让我用 --whitespace=nowarn 将它们屏蔽掉，以免下次运行时看起来显得恐慌，然后检查指南中是否有任何陈旧的引用：
+
+我将把 --whitespace=nowarn 添加到工作流中的两个 git apply 调用中（这些警告来自 Xcode 生成的 vendored 头文件——纯粹是视觉上的，它们把日志弄得乱七八糟，还会引起误导性的关注），并在指南的故障排除表格中添加一行，以便用户能准确了解这个症状。然后重新验证所有内容。
+
+现在将工作流文件重新同步到 kit 目录，重新生成指南 (docx+pdf)，重新打包 zip，并重新运行完整的验证链：
+
+指南已重新生成 — 故障排除表目前有 8 行（包括新的 pbxproj-header 行），没有占位符。现在我来重新打包工具包，并使用修改后的工作流重新运行最终模拟：
+
+ALL-OK，但仿真结果显示 whitespace-warning 上下文行仍然被打印 —— sim_final.sh 有其自己嵌入的 apply() 副本，且没有 --whitespace=nowarn。为了准确模拟 CI，让我同步一下：
+
+sed 命令仅部分生效 —— 直接执行的 git apply --binary "$1" 行未被替换。我来妥善修复它们：
+
+一切正常——现在每个布局的日志都已清理干净（grep 已确认不再出现尾随空格警告，且所有 pbxproj 都验证为有效的 213 对象 plist）。剩余的验证工作：重叠模拟（3-way 冲突检测）、视觉指南检查以及 zip 一致性：
+
+J/K 的行为符合设计预期 —— 针对重叠的 drift（变动），执行 loud-FATAL 并停止运行，而不是生成一个损坏的构建。让我查看一下 J 的设置，以确认这是预期的场景，并验证冲突标记是否确实存在（证明 marker sweep 能够捕获它）：
+
+J's tree shows exactly the designed failure path: overlapping drift → 3-way conflict → markers left + loud FATAL (and the workflow's marker-sweep guard would catch it even if the exit code lied). K (shallow) fails loudly on the missing blob. Both are the intended loud failures.
+
+Now the final consistency check (download ↔ kit dir ↔ zip) and the visual check of the regenerated guide:
+
+所有内容在三个副本中均保持一致（download/build-flekjit.yml = kit dir = zip，修复后的 patch md5 7a8c04…，两个 nowarn 标志均已存在），且新的故障排除行已包含在 docx 中。最后一步 —— 重新生成的指南的视觉检查：
+
+Image input isn't available in this session, so I'll do the page-level check programmatically (blank-page detection via pixel histograms) instead:
+
+该主题存在（“app groups”出现了 4 次）—— 检查脚本的字面模式 roup.（带句号）已不再匹配当前的措辞。这是一个检查模式问题，而非内容缺失。现在我将模式放宽以与其他模式保持一致：
+
+All checks pass. Final state of the todo list and the deliverable set:
+
+
+Thought Process
+为什么你仍然会看到此错误 —— 以及日志中体现的好消息
+这次的失败和上一次不一样了：错误 project.pbxproj: (Unexpected character / at line 1) 来自我在修复后的 workflow 中新增的 plutil -lint 门禁 —— 它在 apply 步骤末尾就把损坏的工程文件拦下了（exit 1），而不是让你白等 20 多分钟后死在 xcodebuild 的 exit 74 上。门禁按设计工作了。
+
+真正的问题是：你的 fork（LiveContainer-jitter）里提交的还是那份旧的、损坏的 flekjit-project.patch。行号取证可以证明 —— 你日志里的 trailing-whitespace 警告在 patch 的 19569/19576/19583/19590/19597 行，这正是旧损坏版的位置（我从 git 历史里恢复了它复现，五个行号逐一吻合，且应用后 pbxproj 第 1 行变成 // !$*UTF8*$ —— 正是 "Unexpected character / at line 1"）。修复版的这些行在 19568/19575/19582/19589/19596（偏 1 行），应用后第 1 行是完好的 // !$*UTF8*$!，213 个对象全部有效。另外三个补丁（core/ui/vpn）新旧 md5 完全一致，只有 project 这一个文件需要换。
+
+顺带说明：那些 trailing-whitespace 行本身不是错误 —— 它们来自 Xcode 自动生成的 vendored 头文件（StikJIT-Swift.h），无害。我已在更新的 workflow 里加了 --whitespace=nowarn，下次运行的日志会干净很多。
+
+你的 fork 的恢复步骤（只需换 1 个文件）
+bash
+git clone https://github.com/<你>/LiveContainer-jitter && cd LiveContainer-jitter
+# 用新 kit 里的修复版覆盖（其余三个补丁不用动）：
+cp /path/to/lc-flekjit-kit/patches/flekjit-project.patch patches/
+# 顺便更新 workflow（nowarn + plutil 门禁已是最新）：
+cp /path/to/lc-flekjit-kit/.github/workflows/build-flekjit.yml .github/workflows/
+git commit -am "flekjit: fixed project patch (pbxproj header), silence ws warnings"
+git push
+然后 Actions → Build FlekJIT fork → Run workflow。预期：flekjit-project.patch applied（无警告刷屏）→ all patches in → plutil 通过 → 进入 xcodebuild。
+
+本次更新的交付物（三处副本 md5 一致，已验证）
+build-flekjit.yml — apply 加 --whitespace=nowarn，其余门禁不变
+lc-flekjit-kit.zip（及解包版 lc-flekjit-kit/，41 个文件）— 修复版 project patch（md5 7a8c04…）+ 新 workflow
+LiveContainer-FlekJIT-Fork-Guide.docx / PDF — Troubleshooting 表新增第一行：这个确切症状（"Unexpected character / at line 1"）的判别与修法
+验证：修复链仿真全部通过（原始克隆、漂移 fork、shallow+full-history、已移植 fork 五种布局，pbxproj 均为有效 213 对象 plist；重叠漂移场景正确地大声失败并留下冲突标记供门禁捕捉）；指南 11 页渲染无空白页、无占位符、主题覆盖检查 MISSING: none。
+
+Generated files
+5
+File
+lc-flekjit-kit
+· zip
+PDF
+LiveContainer-FlekJIT-Fork-Guide
+· pdf
+Word
+LiveContainer-FlekJIT-Fork-Guide
+· docx
+File
+build-flekjit
+· yml
+File
+build-flekjit
+· yml
+Send a Message
+
+
+Connect IM
+
+GLM-5.3
+Max
 name: Build FlekJIT fork
 
 on:
@@ -48,9 +466,9 @@ jobs:
                 fi ;;
             esac
             if git apply --check "patches/$1" 2>/tmp/flekjit.err; then
-              git apply --binary "patches/$1"
+              git apply --binary --whitespace=nowarn "patches/$1"
               echo "$1 applied"
-            elif git apply --binary --3way "patches/$1" 2>>/tmp/flekjit.err; then
+            elif git apply --binary --whitespace=nowarn --3way "patches/$1" 2>>/tmp/flekjit.err; then
               echo "$1 applied via 3-way merge"
             else
               echo "::error::FATAL: $1 no longer applies — your fork's own commits likely shifted the hunk contexts. Restore the affected files and re-run:"
