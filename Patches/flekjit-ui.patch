@@ -1,6 +1,6 @@
 diff --git a/LiveContainerSwiftUI/FlekDeckJIT/FlekBuiltInJITSection.swift b/LiveContainerSwiftUI/FlekDeckJIT/FlekBuiltInJITSection.swift
 new file mode 100644
-index 0000000..f225a6c
+index 0000000..ad946cb
 --- /dev/null
 +++ b/LiveContainerSwiftUI/FlekDeckJIT/FlekBuiltInJITSection.swift
 @@ -0,0 +1,1097 @@
@@ -21,7 +21,7 @@ index 0000000..f225a6c
 +//  the page is filled at a time, the one to tap next, and the check runs by
 +//  itself once the two steps before it are done.
 +//
-+//  Built-in JIT is StikJIT run by LiveContainer itself. A guest that needs JIT
++//  Built-in JIT is StikJIT run by FlekDeck itself. A guest that needs JIT
 +//  starts a second LiveProcess, which reaches the device's own debug service
 +//  through a VPN and attaches to the guest — see enableJITWithStikJIT in
 +//  LCBootstrap. That happens at launch with nothing on screen, so whatever can
@@ -42,7 +42,7 @@ index 0000000..f225a6c
 +
 +    /// One at a time: a check opens a tunnel to the device and may mount a disk
 +    /// image, and two of those at once would mount it twice.
-+    private static let checkQueue = DispatchQueue(label: "com.kdt.livecontainer.builtInJIT.check")
++    private static let checkQueue = DispatchQueue(label: "com.fs.flekdeck.builtInJIT.check")
 +
 +    static let localDevVPNURL = URL(string: "https://apps.apple.com/app/localdevvpn/id6755608044")!
 +
@@ -241,7 +241,7 @@ index 0000000..f225a6c
 +    private enum OfferIcon {
 +        /// A system symbol, at the size of the number.
 +        case symbol(String)
-+        /// An image of LiveContainer's own, fitted to the space the number takes.
++        /// An image of FlekDeck's own, fitted to the space the number takes.
 +        case image(String)
 +    }
 +
@@ -542,8 +542,8 @@ index 0000000..f225a6c
 +
 +    // MARK: 2. VPN
 +
-+    /// The VPN the helper connects through: LiveContainer's own where this copy can
-+    /// provide one, and LocalDevVPN, which LiveContainer has no way to see or to
++    /// The VPN the helper connects through: FlekDeck's own where this copy can
++    /// provide one, and LocalDevVPN, which FlekDeck has no way to see or to
 +    /// start, where it cannot.
 +    @ViewBuilder
 +    private var vpnStep: some View {
@@ -676,7 +676,7 @@ index 0000000..f225a6c
 +    private func checkReadiness(report: FlekJITReport? = nil) {
 +        readiness = .checking(Self.stepText(0, -1))
 +        Task {
-+            // LiveContainer's own VPN is turned on for the check as it is for a
++            // FlekDeck's own VPN is turned on for the check as it is for a
 +            // launch. If it does not come up, the check says so in its own way.
 +            if vpn.isConfigured {
 +                do {
@@ -745,11 +745,11 @@ index 0000000..f225a6c
 +    private func sendReport() {
 +        let vpnState: String
 +        if !FlekLoopbackVPN.isAvailable {
-+            vpnState = "LiveContainer's VPN not in this copy (another VPN app is used)"
++            vpnState = "FlekDeck's VPN not in this copy (another VPN app is used)"
 +        } else if !vpn.isConfigured {
-+            vpnState = "LiveContainer's VPN not set up"
++            vpnState = "FlekDeck's VPN not set up"
 +        } else {
-+            vpnState = "LiveContainer's VPN set up, \(vpn.isOn ? "on" : "off") before the check"
++            vpnState = "FlekDeck's VPN set up, \(vpn.isOn ? "on" : "off") before the check"
 +        }
 +        checkReadiness(report: FlekJITReport(vpn: vpnState))
 +    }
@@ -789,7 +789,7 @@ index 0000000..f225a6c
 +    private func connectionReason() async -> String? {
 +        switch await FlekBuiltInJIT.connection() {
 +        case .mobileData:
-+            // LiveContainer's own VPN has just been turned on, and stays on.
++            // FlekDeck's own VPN has just been turned on, and stays on.
 +            return (vpn.isConfigured ? "lc.flek.jit.check.mobileData" : "lc.flek.jit.check.mobileData.other").loc
 +        case .offline where vpn.isConfigured && !vpn.isOn:
 +            return "lc.flek.jit.check.offline".loc
@@ -907,7 +907,7 @@ index 0000000..f225a6c
 +///
 +/// The tool it sends the user to is FlekPair, FlekSt0re's own: iloader with
 +/// everything but the export of the file taken out, so that there is one
-+/// button to click, and which sends the file on for LiveContainer to collect.
++/// button to click, and which sends the file on for FlekDeck to collect.
 +/// Refresh collects it, and is the button that stands out. Import Manually is
 +/// for a file carried over by hand, which is what iloader itself and
 +/// idevice_pair leave one with: they make the same file and are kept under
@@ -1103,7 +1103,7 @@ index 0000000..f225a6c
 +}
 diff --git a/LiveContainerSwiftUI/FlekDeckJIT/FlekDevicePairing.swift b/LiveContainerSwiftUI/FlekDeckJIT/FlekDevicePairing.swift
 new file mode 100644
-index 0000000..5838022
+index 0000000..6362d92
 --- /dev/null
 +++ b/LiveContainerSwiftUI/FlekDeckJIT/FlekDevicePairing.swift
 @@ -0,0 +1,670 @@
@@ -1111,11 +1111,11 @@ index 0000000..5838022
 +//  FlekDevicePairing.swift
 +//  LiveContainerSwiftUI
 +//
-+//  The first step of the JIT setup done without a computer: LiveContainer makes the
++//  The first step of the JIT setup done without a computer: FlekDeck makes the
 +//  pairing file itself, see LCDevicePairing.
 +//
-+//  The user's part of it is in the Settings app — picking LiveContainer under
-+//  Developer Mode and typing the code LiveContainer shows — so LiveContainer has to go on
++//  The user's part of it is in the Settings app — picking FlekDeck under
++//  Developer Mode and typing the code FlekDeck shows — so FlekDeck has to go on
 +//  running behind Settings, and to get the code in front of the user there.
 +//  Neither is to be had from one thing alone. A continued-processing task, as
 +//  installs use, keeps the app going and shows the code in its Live Activity,
@@ -1139,7 +1139,7 @@ index 0000000..5838022
 +final class FlekDevicePairing: ObservableObject {
 +    enum State: Equatable {
 +        case idle
-+        /// Advertised, and waiting for the user to pick LiveContainer in Settings.
++        /// Advertised, and waiting for the user to pick FlekDeck in Settings.
 +        case waiting
 +        /// The device has connected and asks for this code.
 +        case askingForCode(String)
@@ -1161,8 +1161,8 @@ index 0000000..5838022
 +    @Published private(set) var hasFailedAttempt = false
 +    /// What has happened since the sheet came up, a line each with its time.
 +    @Published private(set) var events: [String] = []
-+    /// What LiveContainer goes by in Settings, where the user looks for it.
-+    static let hostName = "LiveContainer"
++    /// What FlekDeck goes by in Settings, where the user looks for it.
++    static let hostName = "FlekDeck"
 +    /// Whether the code on show is on the clipboard as well, to be pasted
 +    /// where Settings asks for it.
 +    @Published private(set) var isCodeCopied = false
@@ -1352,7 +1352,7 @@ index 0000000..5838022
 +
 +    private func wentBehind() {
 +        // The half minute any app is given on leaving the foreground, asked for
-+        // each time LiveContainer leaves it: the least there is to go on.
++        // each time FlekDeck leaves it: the least there is to go on.
 +        askForBackgroundTime()
 +        let allowed = UIApplication.shared.backgroundTimeRemaining
 +        note("Behind another app, " + (allowed < 3600 ? "\(Int(allowed)) s allowed" : "no limit given"))
@@ -1381,7 +1381,7 @@ index 0000000..5838022
 +        }
 +        backgroundTime = UIApplication.shared.beginBackgroundTask(withName: "Pairing") { [weak self] in
 +            // Out of time. The pairing stays as it is, and goes on from there
-+            // if the user comes back to LiveContainer.
++            // if the user comes back to FlekDeck.
 +            Task { @MainActor in
 +                self?.giveBackBackgroundTime()
 +            }
@@ -1486,7 +1486,7 @@ index 0000000..5838022
 +        return clipboard.changeCount != changes
 +    }
 +
-+    /// The code, over whatever app is in front. Not while that is LiveContainer,
++    /// The code, over whatever app is in front. Not while that is FlekDeck,
 +    /// where the sheet shows it and a notification would not. Worded the way
 +    /// a verification code is in a message.
 +    private func notify(code: String) {
@@ -1646,7 +1646,7 @@ index 0000000..5838022
 +/// Settings, and the code to type there once the device asks for it.
 +///
 +/// Settings asks for two things that look alike, the device's passcode and
-+/// then the code from here, and LiveContainer has no code to show until the first
++/// then the code from here, and FlekDeck has no code to show until the first
 +/// is in: the device does not connect before that. The steps say so, since a
 +/// user who takes the passcode screen for the code's comes back here to find
 +/// none, and gives up.
@@ -1727,7 +1727,7 @@ index 0000000..5838022
 +                case 2:
 +                    pairing.note("Settings opened, with no link")
 +                default:
-+                    pairing.note("Settings opened on LiveContainer's own page")
++                    pairing.note("Settings opened on FlekDeck's own page")
 +                    if let ownPage = URL(string: UIApplication.openSettingsURLString) {
 +                        UIApplication.shared.open(ownPage)
 +                    }
@@ -1779,7 +1779,7 @@ index 0000000..5838022
 +}
 diff --git a/LiveContainerSwiftUI/FlekDeckJIT/FlekJITReport.swift b/LiveContainerSwiftUI/FlekDeckJIT/FlekJITReport.swift
 new file mode 100644
-index 0000000..57d96ab
+index 0000000..c17cfe9
 --- /dev/null
 +++ b/LiveContainerSwiftUI/FlekDeckJIT/FlekJITReport.swift
 @@ -0,0 +1,265 @@
@@ -1794,7 +1794,7 @@ index 0000000..57d96ab
 +//  image it would not mount, the session it closed — and a user's device
 +//  cannot be connected to a computer to read its log. So the report is made by
 +//  running the check again while the device's log is recorded, and holds what
-+//  LiveContainer knows of the setup, each step of the check as it went, and the
++//  FlekDeck knows of the setup, each step of the check as it went, and the
 +//  lines of the device's log from the services built-in JIT goes through.
 +//
 +//  It is a text file, shared from the share sheet, read by people.
@@ -1898,7 +1898,7 @@ index 0000000..57d96ab
 +
 +    /// The processes built-in JIT goes through: the device's pairing and
 +    /// service directory, the disk image mounter and what it asks, the code
-+    /// signing check, the debug server, the VPN, and LiveContainer itself. Lower
++    /// signing check, the debug server, the VPN, and FlekDeck itself. Lower
 +    /// case.
 +    private static let keptProcesses: Set<String> = [
 +        "lockdownd", "remoted", "remotepairingd", "remotepairingdatavaultd",
@@ -1957,7 +1957,7 @@ index 0000000..57d96ab
 +        return text
 +    }
 +
-+    /// What LiveContainer knows of the device and the setup, as label and value.
++    /// What FlekDeck knows of the device and the setup, as label and value.
 +    private func setup() -> [(String, String)] {
 +        let formatter = ISO8601DateFormatter()
 +        formatter.formatOptions = [.withInternetDateTime]
@@ -1967,7 +1967,7 @@ index 0000000..57d96ab
 +
 +        var rows: [(String, String)] = [
 +            ("Date", formatter.string(from: startedAt)),
-+            ("LiveContainer", version),
++            ("FlekDeck", version),
 +            ("Device", Self.modelIdentifier),
 +            ("iOS", UIDevice.current.systemVersion),
 +            ("Pairing file", Self.pairingFileSummary),
@@ -2025,7 +2025,7 @@ index 0000000..57d96ab
 +            if path.isConstrained { summary += ", Low Data Mode" }
 +            semaphore.signal()
 +        }
-+        let queue = DispatchQueue(label: "com.kdt.livecontainer.jitReport.path")
++        let queue = DispatchQueue(label: "com.fs.flekdeck.jitReport.path")
 +        monitor.start(queue: queue)
 +        _ = semaphore.wait(timeout: .now() + 1)
 +        monitor.cancel()
@@ -2050,7 +2050,7 @@ index 0000000..57d96ab
 +}
 diff --git a/LiveContainerSwiftUI/FlekDeckJIT/FlekJITSetup.swift b/LiveContainerSwiftUI/FlekDeckJIT/FlekJITSetup.swift
 new file mode 100644
-index 0000000..a63bbbd
+index 0000000..7993e4d
 --- /dev/null
 +++ b/LiveContainerSwiftUI/FlekDeckJIT/FlekJITSetup.swift
 @@ -0,0 +1,385 @@
@@ -2061,7 +2061,7 @@ index 0000000..a63bbbd
 +//  Whether JIT can be enabled as things stand, asked before an app set to
 +//  launch with JIT is started. A guest enables JIT for itself as it launches,
 +//  so one started without a working setup fails there, and all the user gets
-+//  is an error the next time LiveContainer opens. Asked first, the same thing is a
++//  is an error the next time FlekDeck opens. Asked first, the same thing is a
 +//  warning that says where JIT is set up, and the app is not started.
 +//
 +
@@ -2070,7 +2070,7 @@ index 0000000..a63bbbd
 +
 +/// What built-in JIT needs that can be told without trying to enable it.
 +enum FlekBuiltInJIT {
-+    /// Why built-in JIT cannot work in this copy of LiveContainer whatever the user
++    /// Why built-in JIT cannot work in this copy of FlekDeck whatever the user
 +    /// sets up, or nil. Read once: none of it changes while the app runs.
 +    static let blocker: String? = {
 +#if targetEnvironment(simulator)
@@ -2097,7 +2097,7 @@ index 0000000..a63bbbd
 +    }()
 +
 +    /// Starts a copy that has never had an enabler chosen on built-in JIT, the
-+    /// one enabler that needs nothing outside LiveContainer. What it would start on
++    /// one enabler that needs nothing outside FlekDeck. What it would start on
 +    /// otherwise, upstream's default, wants a server on a computer, and its
 +    /// address and a UDID are the first thing the JIT page then asks for.
 +    /// A copy with such an address filled in is left as it is.
@@ -2251,7 +2251,7 @@ index 0000000..a63bbbd
 +        /// connection has changed, which is then all that is missing. Nil
 +        /// where something else is.
 +        var messageWhileWaiting: String?
-+        /// The device is on mobile data with LiveContainer's own VPN on, so that
++        /// The device is on mobile data with FlekDeck's own VPN on, so that
 +        /// Mobile Data off is all that is missing, which the FlekJIT shortcut
 +        /// can see to (FlekMobileDataShortcut).
 +        var isOverMobileData = false
@@ -2296,7 +2296,7 @@ index 0000000..a63bbbd
 +        /// This copy cannot use built-in JIT, for the reason given.
 +        case unavailable(String)
 +        /// Another enabler is chosen, named here. Whether that one is ready
-+        /// cannot be told from LiveContainer.
++        /// cannot be told from FlekDeck.
 +        case external(String)
 +    }
 +
@@ -2317,7 +2317,7 @@ index 0000000..a63bbbd
 +        default:
 +            return .external(enabler.displayName)
 +        }
-+        // Another LiveContainer uses the primary one's setup, none of which it can
++        // Another FlekDeck uses the primary one's setup, none of which it can
 +        // see, so it says nothing of it.
 +        guard DataManager.shared.model.multiLCStatus == 0 else {
 +            return .notStarted
@@ -2337,7 +2337,7 @@ index 0000000..a63bbbd
 +        // has no Premium, so the case is simply never produced.)
 +        let steps = [
 +            hasFile,
-+            // Another app's VPN where LiveContainer has none, and not to be seen.
++            // Another app's VPN where FlekDeck has none, and not to be seen.
 +            hasVPN || !FlekLoopbackVPN.isAvailable,
 +            hasFile && UserDefaults.standard.double(forKey: "FlekJITReadyAt") > 0,
 +        ]
@@ -2380,7 +2380,7 @@ index 0000000..a63bbbd
 +        }
 +        // Ahead of the setup: without Premium there is none to send anyone to.
 +        try await ensurePremium()
-+        // Another LiveContainer uses the primary one's pairing file, which it
++        // Another FlekDeck uses the primary one's pairing file, which it
 +        // cannot see.
 +        if DataManager.shared.model.multiLCStatus == 0, !FlekBuiltInJIT.hasPairingFile {
 +            throw NotReady(message: "lc.flek.jit.notReady.setUp".loc)
@@ -2412,7 +2412,7 @@ index 0000000..a63bbbd
 +                return
 +            }
 +        }
-+        // No VPN of LiveContainer's own, which leaves LocalDevVPN.
++        // No VPN of FlekDeck's own, which leaves LocalDevVPN.
 +        if !(await FlekBuiltInJIT.isDeviceReachable()) {
 +            if FlekLoopbackVPN.isAvailable {
 +                throw NotReady(message: "lc.flek.jit.notReady.setUp".loc)
@@ -2441,7 +2441,7 @@ index 0000000..a63bbbd
 +}
 diff --git a/LiveContainerSwiftUI/FlekDeckJIT/FlekMobileDataShortcut.swift b/LiveContainerSwiftUI/FlekDeckJIT/FlekMobileDataShortcut.swift
 new file mode 100644
-index 0000000..95a97b6
+index 0000000..dd37222
 --- /dev/null
 +++ b/LiveContainerSwiftUI/FlekDeckJIT/FlekMobileDataShortcut.swift
 @@ -0,0 +1,493 @@
@@ -2451,21 +2451,21 @@ index 0000000..95a97b6
 +//
 +//  JIT cannot be started while the device is on mobile data, and can once
 +//  Mobile Data is switched off, with the VPN left on: found on a device with
-+//  iOS 27. LiveContainer turns its own VPN on, so away from Wi-Fi all that is
++//  iOS 27. FlekDeck turns its own VPN on, so away from Wi-Fi all that is
 +//  missing is Mobile Data off for the moment JIT takes to come on. iOS lets no
 +//  app switch that. The Shortcuts app can, so the user adds a shortcut,
-+//  "FlekJIT", which LiveContainer runs: with "off" as an app set to launch with JIT
++//  "FlekJIT", which FlekDeck runs: with "off" as an app set to launch with JIT
 +//  is started over mobile data, and with "on" once JIT is on.
 +//
 +//  An app can run a shortcut only by opening the Shortcuts app, which comes to
-+//  the front for a moment and hands back through a link of LiveContainer's own.
++//  the front for a moment and hands back through a link of FlekDeck's own.
 +//
 +//  "On" is run by whatever is in front when JIT comes on: here where the app
-+//  runs in a window, and by the launched app itself where it takes LiveContainer's
++//  runs in a window, and by the launched app itself where it takes FlekDeck's
 +//  place (LCTurnMobileDataBackOn in LCBootstrap). That Mobile Data is off is
 +//  noted in the shared settings from before the shortcut runs, so that a
 +//  launch that ends before JIT is on leaves it to be switched back on the next
-+//  time LiveContainer opens.
++//  time FlekDeck opens.
 +//
 +
 +import Darwin
@@ -2484,11 +2484,11 @@ index 0000000..95a97b6
 +    /// Where the Shortcuts app opens straight at Add Shortcut, which it does
 +    /// only for an iCloud link, and that lives only while the shortcut stays
 +    /// in its owner's library. None is set, so the shortcut is added from
-+    /// LiveContainer's own copy, through the share sheet. One set here has to be of
++    /// FlekDeck's own copy, through the share sheet. One set here has to be of
 +    /// the same shortcut as that copy.
 +    static let iCloudLink: URL? = nil
 +
-+    /// What the shortcut's link back to LiveContainer is addressed to.
++    /// What the shortcut's link back to FlekDeck is addressed to.
 +    static let linkHost = "jit-mobile-data"
 +
 +    /// Where it is noted that the user has been through adding the shortcut,
@@ -2512,7 +2512,7 @@ index 0000000..95a97b6
 +
 +    /// What the helper posts once it is done with its connection, JIT on or
 +    /// not (StikJITHeadless).
-+    private static let helperOver = "com.kdt.livecontainer.flekjit.over"
++    private static let helperOver = "com.flekdeck.jit.over"
 +
 +    enum Outcome {
 +        /// The shortcut ran to its end.
@@ -2522,7 +2522,7 @@ index 0000000..95a97b6
 +        case failed
 +    }
 +
-+    /// Whether there is anything to offer: LiveContainer has to have the VPN, to
++    /// Whether there is anything to offer: FlekDeck has to have the VPN, to
 +    /// turn it on ahead of Mobile Data going off, and the device mobile data.
 +    static let isOffered = FlekLoopbackVPN.isAvailable && hasMobileData
 +
@@ -2554,9 +2554,9 @@ index 0000000..95a97b6
 +    private var waiting: ((Outcome) -> Void)?
 +    /// Counts the runs, for telling a timer that belongs to an earlier one.
 +    private var runCount = 0
-+    /// LiveContainer has gone behind the Shortcuts app for the run under way.
++    /// FlekDeck has gone behind the Shortcuts app for the run under way.
 +    private var hasLeft = false
-+    /// Mobile Data is to go back on as soon as LiveContainer is in front.
++    /// Mobile Data is to go back on as soon as FlekDeck is in front.
 +    private var turnsOnWhenActive = false
 +
 +    private init() {
@@ -2570,7 +2570,7 @@ index 0000000..95a97b6
 +        center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
 +            Task { @MainActor in self?.cameToFront() }
 +        }
-+        // An app in a window has LiveContainer in front, and its helper says when
++        // An app in a window has FlekDeck in front, and its helper says when
 +        // it is done.
 +        var token: Int32 = 0
 +        notify_register_dispatch(Self.helperOver, &token, .main) { [weak self] _ in
@@ -2586,7 +2586,7 @@ index 0000000..95a97b6
 +    // MARK: Mobile Data
 +
 +    /// Switches Mobile Data off for a launch. `completion` is called once
-+    /// LiveContainer is back in front, and whether it worked shows in what the
++    /// FlekDeck is back in front, and whether it worked shows in what the
 +    /// device is then connected through rather than in what the shortcut said.
 +    func turnMobileDataOff(completion: @escaping (Outcome) -> Void) {
 +        // From before it runs: one that ends halfway may have switched it.
@@ -2627,7 +2627,7 @@ index 0000000..95a97b6
 +    private func run(_ word: String, completion: @escaping (Outcome) -> Void) {
 +        // One at a time: an earlier one is not answered by this one's link.
 +        finish(.failed)
-+        let back = "\(LCUtils.appUrlScheme() ?? "livecontainer")://\(Self.linkHost)"
++        let back = "\(LCUtils.appUrlScheme() ?? "flekdeck")://\(Self.linkHost)"
 +        var link = URLComponents()
 +        link.scheme = "shortcuts"
 +        link.host = "x-callback-url"
@@ -2674,7 +2674,7 @@ index 0000000..95a97b6
 +        }
 +        // Back from the Shortcuts app, and perhaps without its link: the user
 +        // came back by hand, or it had nothing by that name to run. The link
-+        // can follow LiveContainer to the front, so it is given a moment.
++        // can follow FlekDeck to the front, so it is given a moment.
 +        guard waiting != nil, hasLeft else {
 +            return
 +        }
@@ -2706,7 +2706,7 @@ index 0000000..95a97b6
 +
 +    // MARK: Adding
 +
-+    /// LiveContainer's own copy of the shortcut, under the name it has to be added
++    /// FlekDeck's own copy of the shortcut, under the name it has to be added
 +    /// by, for the share sheet to hand to the Shortcuts app. It is kept in the
 +    /// asset catalog, which needs no place in the project of its own.
 +    static func fileToAdd() -> URL? {
@@ -2940,10 +2940,10 @@ index 0000000..95a97b6
 +}
 diff --git a/LiveContainerSwiftUI/FlekDeckJIT/FlekPairingDownload.swift b/LiveContainerSwiftUI/FlekDeckJIT/FlekPairingDownload.swift
 new file mode 100644
-index 0000000..8e91e98
+index 0000000..48b477e
 --- /dev/null
 +++ b/LiveContainerSwiftUI/FlekDeckJIT/FlekPairingDownload.swift
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,162 @@
 +//
 +//  FlekPairingDownload.swift
 +//  LiveContainerSwiftUI
@@ -3015,7 +3015,7 @@ index 0000000..8e91e98
 +        let udid = try await deviceUDID()
 +        // The server tells UDIDs apart by the case of their letters, and
 +        // FlekPair files a pairing file under the UDID as the device spells
-+        // it. That spelling is asked for first, and the one LiveContainer was told
++        // it. That spelling is asked for first, and the one FlekDeck was told
 +        // after it, where the two differ.
 +        let spelled = udid.count == 40 ? udid.lowercased() : udid.uppercased()
 +        var sent = try await sentFile(for: spelled)
@@ -3098,13 +3098,24 @@ index 0000000..8e91e98
 +        throw Failure.unknownDevice
 +    }
 +}
++
++// Lives in FlekDeck's Shared.swift, which this port does not carry.
++private extension String {
++    /// A device UDID as the pairing servers spell it: 8-16 or 40 hex digits.
++    var isDeviceUDID: Bool {
++        range(of: "^([0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}|[0-9A-Fa-f]{40})$", options: .regularExpression) != nil
++    }
++}
 diff --git a/LiveContainerSwiftUI/FlekDeckJIT/_FlekRowCheckmark.swift b/LiveContainerSwiftUI/FlekDeckJIT/_FlekRowCheckmark.swift
 new file mode 100644
-index 0000000..87d7b95
+index 0000000..02b8e44
 --- /dev/null
 +++ b/LiveContainerSwiftUI/FlekDeckJIT/_FlekRowCheckmark.swift
-@@ -0,0 +1,40 @@
-+/// Ported from LiveContainer's installer view, which this port does not carry:
+@@ -0,0 +1,43 @@
++import SwiftUI
++import UIKit
++
++/// Ported from FlekDeck's installer view, which this port does not carry:
 +/// the received-pairing-file row uses it for its animation.
 +
 +struct FlekRowCheckmark: View {
@@ -3218,7 +3229,7 @@ index 0000000..2beddd0
 +NS_ASSUME_NONNULL_END
 diff --git a/LiveContainerSwiftUI/Utilities/LCDeviceLog.m b/LiveContainerSwiftUI/Utilities/LCDeviceLog.m
 new file mode 100644
-index 0000000..ec540a9
+index 0000000..167487f
 --- /dev/null
 +++ b/LiveContainerSwiftUI/Utilities/LCDeviceLog.m
 @@ -0,0 +1,245 @@
@@ -3346,7 +3357,7 @@ index 0000000..ec540a9
 +    // The thread holds on to the recorder until it ends, which is after
 +    // `stop`, once the next line has arrived.
 +    NSThread *thread = [[NSThread alloc] initWithTarget:self selector:@selector(record) object:nil];
-+    thread.name = @"com.kdt.livecontainer.deviceLog";
++    thread.name = @"com.fs.flekdeck.deviceLog";
 +    thread.qualityOfService = NSQualityOfServiceUtility;
 +    [thread start];
 +}
@@ -3417,7 +3428,7 @@ index 0000000..ec540a9
 +
 +    AdapterHandle *adapter = NULL;
 +    RsdHandshakeHandle *handshake = NULL;
-+    error = tunnel_create_remotexpc((const struct sockaddr *)&address, sizeof(address), "LiveContainer",
++    error = tunnel_create_remotexpc((const struct sockaddr *)&address, sizeof(address), "FlekDeck",
 +                                    pairingFile, NULL, NULL, &adapter, &handshake);
 +    if(error) {
 +        rp_pairing_file_free(pairingFile);
@@ -3469,7 +3480,7 @@ index 0000000..ec540a9
 +@end
 diff --git a/LiveContainerSwiftUI/Utilities/LCDevicePairing.h b/LiveContainerSwiftUI/Utilities/LCDevicePairing.h
 new file mode 100644
-index 0000000..7ba51b3
+index 0000000..2b699a6
 --- /dev/null
 +++ b/LiveContainerSwiftUI/Utilities/LCDevicePairing.h
 @@ -0,0 +1,65 @@
@@ -3489,7 +3500,7 @@ index 0000000..7ba51b3
 +typedef NS_ERROR_ENUM(LCDevicePairingErrorDomain, LCDevicePairingError) {
 +    /// IdevicePairing.dylib is not in this build, or would not load.
 +    LCDevicePairingErrorUnavailable = 1,
-+    /// The user has not allowed LiveContainer onto the local network.
++    /// The user has not allowed FlekDeck onto the local network.
 +    LCDevicePairingErrorLocalNetworkDenied,
 +    /// Nothing could be advertised, or listened on.
 +    LCDevicePairingErrorNetwork,
@@ -3497,7 +3508,7 @@ index 0000000..7ba51b3
 +    LCDevicePairingErrorLibrary,
 +};
 +
-+/// Advertises LiveContainer as a host this device can be paired with, and takes the
++/// Advertises FlekDeck as a host this device can be paired with, and takes the
 +/// pairing once the user starts it from Settings › Privacy & Security ›
 +/// Developer Mode, which iOS 27 lets a device do with a host on its network —
 +/// itself included. An instance pairs once.
@@ -4119,7 +4130,7 @@ index 7f8ccde..1223c84 100644
          await MainActor.run {
              if let jitEnabler = JITEnablerType(rawValue: LCUtils.appGroupUserDefault.integer(forKey: "LCJITEnablerType")), jitEnabler == .BuiltIn {
 diff --git a/Resources/Localizable.xcstrings b/Resources/Localizable.xcstrings
-index 6b4f98a..e38a055 100644
+index 6b4f98a..9d0bb83 100644
 --- a/Resources/Localizable.xcstrings
 +++ b/Resources/Localizable.xcstrings
 @@ -1,6 +1,2371 @@
@@ -4165,7 +4176,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "This certificate doesn’t match the LiveContainer installed on this device. Please select the certificate LiveContainer was signed with."
++            "value" : "This certificate doesn’t match the FlekDeck installed on this device. Please select the certificate FlekDeck was signed with."
 +          }
 +        }
 +      }
@@ -4374,7 +4385,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Get a ready-to-use LiveContainer installation with a compatible **Development certificate already configured.**"
++            "value" : "Get a ready-to-use FlekDeck installation with a compatible **Development certificate already configured.**"
 +          }
 +        }
 +      }
@@ -4418,7 +4429,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Your .p12 certificate and .mobileprovision profile **must be Development type** and belong to the same Apple Developer team as the LiveContainer app installed on this device."
++            "value" : "Your .p12 certificate and .mobileprovision profile **must be Development type** and belong to the same Apple Developer team as the FlekDeck app installed on this device."
 +          }
 +        }
 +      }
@@ -4429,7 +4440,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "This is the certificate FlekSt0re set up for LiveContainer. It will be set up again the next time LiveContainer opens, unless you import another certificate first."
++            "value" : "This is the certificate FlekSt0re set up for FlekDeck. It will be set up again the next time FlekDeck opens, unless you import another certificate first."
 +          }
 +        }
 +      }
@@ -4495,7 +4506,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "This certificate is no longer valid and can’t be used to launch apps. Reinstall LiveContainer from FlekSt0re to get a new one."
++            "value" : "This certificate is no longer valid and can’t be used to launch apps. Reinstall FlekDeck from FlekSt0re to get a new one."
 +          }
 +        }
 +      }
@@ -4539,7 +4550,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "This installation of LiveContainer is signed with a certificate that isn’t Development type."
++            "value" : "This installation of FlekDeck is signed with a certificate that isn’t Development type."
 +          }
 +        }
 +      }
@@ -4550,7 +4561,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "To launch apps with your current installation, you can **set up JIT instead**. Alternatively, you can reinstall LiveContainer using a compatible Development certificate."
++            "value" : "To launch apps with your current installation, you can **set up JIT instead**. Alternatively, you can reinstall FlekDeck using a compatible Development certificate."
 +          }
 +        }
 +      }
@@ -4561,7 +4572,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Due to how certificate mode works on iOS, LiveContainer can only import and use a certificate for launching apps when LiveContainer itself is signed with a compatible Development certificate."
++            "value" : "Due to how certificate mode works on iOS, FlekDeck can only import and use a certificate for launching apps when FlekDeck itself is signed with a compatible Development certificate."
 +          }
 +        }
 +      }
@@ -4649,7 +4660,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "This installation of LiveContainer is signed without get-task-allow, so iOS won’t let JIT be enabled for it. Reinstall it signed with a Development certificate."
++            "value" : "This installation of FlekDeck is signed without get-task-allow, so iOS won’t let JIT be enabled for it. Reinstall it signed with a Development certificate."
 +          }
 +        }
 +      }
@@ -4682,7 +4693,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "This build of LiveContainer doesn’t include FlekJIT."
++            "value" : "This build of FlekDeck doesn’t include FlekJIT."
 +          }
 +        }
 +      }
@@ -4891,7 +4902,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Connect this device with a cable and click Send to LiveContainer. Tap Trust here if asked."
++            "value" : "Connect this device with a cable and click Send to FlekDeck. Tap Trust here if asked."
 +          }
 +        }
 +      }
@@ -4902,7 +4913,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Tap Refresh below. LiveContainer collects the file."
++            "value" : "Tap Refresh below. FlekDeck collects the file."
 +          }
 +        }
 +      }
@@ -5012,7 +5023,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "In Shortcuts, tap Add Shortcut, then come back to LiveContainer."
++            "value" : "In Shortcuts, tap Add Shortcut, then come back to FlekDeck."
 +          }
 +        }
 +      }
@@ -5309,7 +5320,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "No computer needed. Needs iOS 27 or later."
++            "value" : "No computer needed. Works while Premium is active."
 +          }
 +        }
 +      }
@@ -5419,7 +5430,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "LiveContainer doesn’t know this device’s UDID, so it can’t look for the file. Import it manually instead."
++            "value" : "FlekDeck doesn’t know this device’s UDID, so it can’t look for the file. Import it manually instead."
 +          }
 +        }
 +      }
@@ -5474,7 +5485,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "LiveContainer needs Local Network access for this. Turn it on in Settings › Privacy & Security › Local Network."
++            "value" : "FlekDeck needs Local Network access for this. Turn it on in Settings › Privacy & Security › Local Network."
 +          }
 +        }
 +      }
@@ -5496,7 +5507,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Your LiveContainer pairing code is %@"
++            "value" : "Your FlekDeck pairing code is %@"
 +          }
 +        }
 +      }
@@ -5507,7 +5518,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Your LiveContainer pairing code is %@. It’s copied, ready to paste."
++            "value" : "Your FlekDeck pairing code is %@. It’s copied, ready to paste."
 +          }
 +        }
 +      }
@@ -5837,7 +5848,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Lets LiveContainer turn JIT on for this device."
++            "value" : "Lets FlekDeck turn JIT on for this device."
 +          }
 +        }
 +      }
@@ -5892,7 +5903,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "LiveContainer can’t provide its own VPN here (that takes a paid Apple Developer account). Connect LocalDevVPN before starting an app with JIT."
++            "value" : "This copy of FlekDeck can’t provide the VPN. Connect LocalDevVPN before starting an app with JIT."
 +          }
 +        }
 +      }
@@ -5991,7 +6002,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "On LiveContainer’s home screen, touch and hold the app’s icon and tap **Settings**."
++            "value" : "On FlekDeck’s home screen, touch and hold the app’s icon and tap **Settings**."
 +          }
 +        }
 +      }
@@ -6013,7 +6024,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "When StikDebug shows **JIT request completed**, switch back to LiveContainer. The app is running with JIT."
++            "value" : "When StikDebug shows **JIT request completed**, switch back to FlekDeck. The app is running with JIT."
 +          }
 +        }
 +      }
@@ -6024,7 +6035,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Go Back to LiveContainer"
++            "value" : "Go Back to FlekDeck"
 +          }
 +        }
 +      }
@@ -6068,7 +6079,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Use It in LiveContainer"
++            "value" : "Use It in FlekDeck"
 +          }
 +        }
 +      }
@@ -6112,7 +6123,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "In LiveContainer, open **Settings** › **JIT** and set **JIT Enabler** to **StikDebug**."
++            "value" : "In FlekDeck, open **Settings** › **JIT** and set **JIT Enabler** to **StikDebug**."
 +          }
 +        }
 +      }
@@ -6244,7 +6255,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "StikDebug is a free app that turns JIT on for the apps in LiveContainer. It needs iOS 17.4 or later, and a computer for the first setup."
++            "value" : "StikDebug is a free app that turns JIT on for the apps in FlekDeck. It needs iOS 17.4 or later, and a computer for the first setup."
 +          }
 +        }
 +      }
@@ -6277,7 +6288,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "LiveContainer should now appear on StikDebug’s **Apps** tab. If it doesn’t, close StikDebug and open it again."
++            "value" : "FlekDeck should now appear on StikDebug’s **Apps** tab. If it doesn’t, close StikDebug and open it again."
 +          }
 +        }
 +      }
@@ -6288,7 +6299,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Check That LiveContainer Is Listed"
++            "value" : "Check That FlekDeck Is Listed"
 +          }
 +        }
 +      }
@@ -6376,7 +6387,7 @@ index 6b4f98a..e38a055 100644
 +        "en" : {
 +          "stringUnit" : {
 +            "state" : "translated",
-+            "value" : "Make sure LocalDevVPN is connected, then start the app. LiveContainer switches to StikDebug, which asks to enable JIT. Tap **Enable JIT**, or **Enable and Run Script**."
++            "value" : "Make sure LocalDevVPN is connected, then start the app. FlekDeck switches to StikDebug, which asks to enable JIT. Tap **Enable JIT**, or **Enable and Run Script**."
 +          }
 +        }
 +      }

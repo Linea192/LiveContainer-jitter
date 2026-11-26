@@ -1,5 +1,5 @@
 diff --git a/LiveContainer/LCSharedUtils.m b/LiveContainer/LCSharedUtils.m
-index 3552c8c..9d8797d 100644
+index 3552c8c..25fefd0 100644
 --- a/LiveContainer/LCSharedUtils.m
 +++ b/LiveContainer/LCSharedUtils.m
 @@ -11,6 +11,23 @@ extern NSBundle *lcMainBundle;
@@ -56,7 +56,7 @@ index 3552c8c..9d8797d 100644
 +        return;
 +    }
 +    [managerClass loadAllFromPreferencesWithCompletionHandler:^(NSArray *managers, NSError *error) {
-+        // An app is only ever given its own configurations, and LiveContainer has one.
++        // An app is only ever given its own configurations, and FlekDeck has one.
 +        LCVPNManager *manager = managers.firstObject;
 +        if(!manager) {
 +            finish(NO);
@@ -91,7 +91,7 @@ index 3552c8c..9d8797d 100644
      return defaultSchemes;
 diff --git a/LiveContainerSwiftUI/FlekDeckJIT/FlekLoopbackVPN.swift b/LiveContainerSwiftUI/FlekDeckJIT/FlekLoopbackVPN.swift
 new file mode 100644
-index 0000000..adb1d12
+index 0000000..2279362
 --- /dev/null
 +++ b/LiveContainerSwiftUI/FlekDeckJIT/FlekLoopbackVPN.swift
 @@ -0,0 +1,155 @@
@@ -99,7 +99,7 @@ index 0000000..adb1d12
 +//  FlekLoopbackVPN.swift
 +//  LiveContainerSwiftUI
 +//
-+//  The app's side of LiveContainer's own VPN, the one built-in JIT connects through;
++//  The app's side of FlekDeck's own VPN, the one built-in JIT connects through;
 +//  LoopbackTunnelProvider says what the VPN does and why JIT needs it. Here are
 +//  the configuration iOS asks the user to allow, and turning the VPN on and off
 +//  from Settings.
@@ -126,7 +126,7 @@ index 0000000..adb1d12
 +final class FlekLoopbackVPN: ObservableObject {
 +    static let shared = FlekLoopbackVPN()
 +
-+    /// Whether this copy of LiveContainer can provide the VPN at all. It takes the
++    /// Whether this copy of FlekDeck can provide the VPN at all. It takes the
 +    /// extension, which some installers leave out, and the Network Extensions
 +    /// entitlement on both the app and the extension, which is up to whatever
 +    /// signed this copy. Read once: none of it changes while the app runs.
@@ -166,7 +166,7 @@ index 0000000..adb1d12
 +
 +    /// Finds the configuration again: it is kept by iOS, not by the app.
 +    func refresh() async {
-+        // An app is only ever given its own configurations, and LiveContainer has
++        // An app is only ever given its own configurations, and FlekDeck has
 +        // the one.
 +        adopt((try? await NETunnelProviderManager.loadAllFromPreferences())?.first)
 +    }
@@ -252,7 +252,7 @@ index 0000000..adb1d12
 +}
 diff --git a/LoopbackVPN/Info.plist b/LoopbackVPN/Info.plist
 new file mode 100644
-index 0000000..901bedb
+index 0000000..baf2a00
 --- /dev/null
 +++ b/LoopbackVPN/Info.plist
 @@ -0,0 +1,29 @@
@@ -261,7 +261,7 @@ index 0000000..901bedb
 +<plist version="1.0">
 +<dict>
 +	<key>CFBundleDisplayName</key>
-+	<string>LiveContainer</string>
++	<string>FlekDeck</string>
 +	<key>CFBundleExecutable</key>
 +	<string>$(EXECUTABLE_NAME)</string>
 +	<key>CFBundleIdentifier</key>
