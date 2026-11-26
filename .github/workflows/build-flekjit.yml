@@ -940,8 +940,18 @@ jobs:
         run: |
           set -o pipefail
           xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -project LiveContainer.xcodeproj \
-            -sdk iphoneos -arch arm64 -configuration Release 2>&1 | tee build.log | tail -60
-          grep -q "ARCHIVE SUCCEEDED" build.log || { echo "::error::archive failed"; tail -120 build.log; exit 1; }
+            -sdk iphoneos -arch arm64 -configuration Release 2>&1 | tee build.log | tail -30
+          grep -q "ARCHIVE SUCCEEDED" build.log || {
+            echo "::error::archive failed"
+            echo "----- every error and note in build.log, with context -----"
+            grep -nE "error:|note:|fatal error" build.log | tail -100
+            echo "----- context around the first error -----"
+            first=$(grep -nE "error:|fatal error" build.log | head -1 | cut -d: -f1)
+            [ -n "$first" ] && sed -n "$((first>25 ? first-25 : 1)),$((first+15))p" build.log
+            echo "----- last 250 lines -----"
+            tail -250 build.log
+            exit 1;
+          }
 
       - name: Sign for the VPN (ldid)
         run: |
