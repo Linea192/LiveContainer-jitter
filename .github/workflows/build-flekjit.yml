@@ -34,23 +34,33 @@ jobs:
       - name: Apply FlekJIT patches
         run: |
           set -eu
-          apply() { # patchfile, gate — "marker:file" (unique line this patch adds) or "file" (a file only this patch creates)
+          find_patch() { # name as the kit spells it -> wherever the fork keeps it (folder and letter case may differ)
+            local rest="${1#flekjit-}" p
+            for p in "Patches/$1" "patches/$1" "Patches/Flekjit-$rest" "patches/Flekjit-$rest"; do
+              if [ -f "$p" ]; then echo "$p"; return 0; fi
+            done
+            find . -path ./.git -prune -o -type f -iname "$1" -print | head -n 1
+          }
+          apply() { # patch name, gate: "marker:file" (a line only this patch adds) or "file" (a file only it creates)
+            local patch
+            patch="$(find_patch "$1")"
+            if [ -z "$patch" ]; then
+              echo "::error::FATAL: $1 not found in this fork (looked in Patches/ and patches/)"; exit 1
+            fi
             case "$2" in
               *:*)
                 if grep -qF "${2%%:*}" "${2#*:}" 2>/dev/null; then
-                  echo "$1: already present in this fork — skipping"
-                  return 0
+                  echo "$1: already present in this fork — skipping"; return 0
                 fi ;;
               *)
                 if [ -e "$2" ]; then
-                  echo "$1: already present in this fork — skipping"
-                  return 0
+                  echo "$1: already present in this fork — skipping"; return 0
                 fi ;;
             esac
-            if git apply --check "patches/$1" 2>/tmp/flekjit.err; then
-              git apply --binary --whitespace=nowarn "patches/$1"
+            if git apply --check "$patch" 2>/tmp/flekjit.err; then
+              git apply --binary --whitespace=nowarn "$patch"
               echo "$1 applied"
-            elif git apply --binary --whitespace=nowarn --3way "patches/$1" 2>>/tmp/flekjit.err; then
+            elif git apply --binary --whitespace=nowarn --3way "$patch" 2>>/tmp/flekjit.err; then
               echo "$1 applied via 3-way merge"
             else
               echo "::error::FATAL: $1 no longer applies — your fork's own commits likely shifted the hunk contexts. Restore the affected files and re-run:"
@@ -69,13 +79,861 @@ jobs:
             echo "::error::conflict markers left in the tree — a 3-way merge went wrong"
             exit 1
           fi
-          # Guard 2: the project file must be a valid property list before
-          # xcodebuild ever opens it (a corrupted pbxproj is the classic
-          # 'not a valid property list' failure).
-          plutil -lint LiveContainer.xcodeproj/project.pbxproj
+
+          # Guard 2: the project file must be one xcodebuild can open. Older copies of the
+          # project patch are not (a target proxy points at the wrong object: "The
+          # PBXContainerItemProxy with ID ... has an invalid value for containerPortal",
+          # exit code 74). Check it here and repair it in place before xcodebuild sees it.
+          cat > /tmp/flekjit_project.py <<'FLEKJIT_PROJECT_PY'
+          #!/usr/bin/env python3
+          """flekjit_project.py — the Xcode project side of the FlekJIT patch kit for LiveContainer.
+
+          Standard library only. Two commands, both given the root of the checked-out fork:
+
+            python3 flekjit_project.py repair <repo root>
+                Brings the project file, and the two xcconfig files its new targets read, into the
+                state the kit expects, whichever version of flekjit-project.patch produced them. Every
+                step looks first and changes only what is wrong, so a second run changes nothing.
+
+            python3 flekjit_project.py check <repo root>
+                Exits 1 with one line per problem when anything is wrong that xcodebuild would reject,
+                or would build wrongly: references to objects that do not exist or are of the wrong kind
+                (this is the error xcodebuild reports first and nothing else), targets the project does
+                not know about, the VPN extension not embedded where iOS looks for it, files missing on
+                disk.
+
+          The targets the kit adds to LiveContainer:
+
+            LoopbackVPN       LoopbackVPN.appex — the app's own VPN. A packet tunnel that leads
+                              back to this device, which is what built-in JIT connects through.
+            StikJITHeadless   StikJITHeadless.framework — the JIT helper, built on StikJIT.framework.
+            IdevicePairing    IdevicePairing.dylib — device pairing for Settings, loaded by the app.
+          """
+          import os
+          import plistlib
+          import re
+          import sys
+
+          HEX24 = '[0-9A-F]{24}'
+          OBJECT_START = re.compile(r'^\t\t(%s)(?: /\*.*?\*/)? = \{' % HEX24, re.M)
+          SECTION_END = re.compile(r'^/\* End \w+ section \*/', re.M)
+
+          # --------------------------------------------------------------------------------------------------
+          # Object IDs. The first block is upstream's; the rest were fixed when the kit was made.
+          # --------------------------------------------------------------------------------------------------
+          PROJECT = '17DCE9952C7067EC00731D42'        # the PBXProject object
+          MAIN_GROUP = '17DCE9942C7067EC00731D42'
+          PRODUCTS = '17DCE99E2C7067EC00731D42'
+          APP = '17DCE99C2C7067EC00731D42'            # LiveContainer target
+          EMBED_EXTENSIONS = '17DCE9D92C7067ED00731D42'   # Embed Foundation Extensions -> PlugIns/
+          EMBED_FRAMEWORKS = '17413FC12D9C0BAE00F3F928'   # Embed Frameworks -> Frameworks/
+          FRAMEWORKS_GROUP = '174140B82D9C0F9100F3F928'   # the "Frameworks" group under the main group
+          XCCONFIGS_GROUP = '17B0F8452DE16FE4008110EA'   # upstream's "xcconfigs" folder, as the project knows it
+
+          VPN_TARGET = 'F1EC0DE1305600000A000001'
+          VPN_PRODUCT = 'F1EC0DE1305600000A000002'   # LoopbackVPN.appex
+          VPN_GROUP = 'F1EC0DE1305600000A000003'     # the synchronized folder LoopbackVPN/
+          VPN_EXCEPTIONS = 'F1EC0DE1305600000A000004'   # its membership exceptions (Info.plist)
+          VPN_RESOURCES = 'F1EC0DE1305600000A000007'
+          VPN_DEBUG = 'F1EC0DE1305600000A000009'
+          VPN_RELEASE = 'F1EC0DE1305600000A00000A'
+          VPN_IN_EMBED = 'F1EC0DE1305600000A00000E'  # LoopbackVPN.appex in Embed Foundation Extensions
+          OLD_EMBED_PHASE = VPN_EXCEPTIONS           # what older patches wrote under this ID
+
+          HELPER_TARGET = 'E15C6F2730440EAD00FEC6BD'
+          HELPER_PRODUCT = 'E15C6F2830440EAD00FEC6BD'   # StikJITHeadless.framework
+          HELPER_GROUP = 'E15C6F2930440EAD00FEC6BD'     # the synchronized folder StikJITHeadless/
+          HELPER_SOURCES = 'E15C6F2430440EAD00FEC6BD'
+          HELPER_FRAMEWORKS = 'E15C6F2530440EAD00FEC6BD'
+          HELPER_RESOURCES = 'E15C6F2630440EAD00FEC6BD'
+          HELPER_DEBUG = 'E15C6F3130440EAD00FEC6BD'
+          HELPER_RELEASE = 'E15C6F3230440EAD00FEC6BD'
+          HELPER_DEPENDENCY = 'E15C6F2B30440EAD00FEC6BD'
+          HELPER_IN_EMBED = 'E15C6F2F30440EAD00FEC6BD'  # StikJITHeadless.framework in Embed Frameworks
+
+          STIKJIT = 'E1F04CE630527A2200EABBF1'       # StikJIT.framework, inside its xcframework
+          STIKJIT_LINK = 'E1F04CE730527A2200EABBF1'  # ... linked into StikJITHeadless
+          STIKJIT_IN_EMBED = 'F1EC0DE0305600020B000101'   # ... copied into the app
+
+          PAIRING = 'F1EC0DE0305600010B000102'       # IdevicePairing.dylib
+          PAIRING_IN_EMBED = 'F1EC0DE0305600010B000101'   # ... copied into the app
+
+          KIT_TARGETS = {VPN_TARGET: 'LoopbackVPN', HELPER_TARGET: 'StikJITHeadless'}
+
+          # The file each of the kit's targets takes its base settings from, as every target of this
+          # project does. Global.xcconfig is where the team and the bundle ID prefix are defined;
+          # a target without an xcconfig would get neither, and the tunnel would be built as
+          # ".LoopbackVPN".
+          XCCONFIGS = {
+              'LoopbackVPN.xcconfig': '''//
+          //  LoopbackVPN.xcconfig
+          //  LiveContainer
+          //
+
+          #include "Global.xcconfig"
+
+          PRODUCT_BUNDLE_IDENTIFIER = $(LIVECONTAINER_BUNDLE_IDENTIFIER).LoopbackVPN
+
+          ''',
+              'StikJITHeadless.xcconfig': '''//
+          //  StikJITHeadless.xcconfig
+          //  LiveContainer
+          //
+
+          #include "Global.xcconfig"
+
+          ''',
+          }
+          VPN_XCCONFIG = 'LoopbackVPN.xcconfig'
+          HELPER_XCCONFIG = 'StikJITHeadless.xcconfig'
+
+
+          class RepairError(Exception):
+              """The project file is not shaped the way the kit's steps expect."""
+
+
+          # --------------------------------------------------------------------------------------------------
+          # OpenStep property list reader (the format of project.pbxproj)
+          # --------------------------------------------------------------------------------------------------
+          class PlistError(Exception):
+              pass
+
+
+          WHITESPACE = ' \t\r\n'
+          DELIMITERS = '{}();,='
+
+
+          class _Scanner:
+              def __init__(self, text):
+                  self.text = text
+                  self.pos = 0
+
+              def skip(self):
+                  text, size = self.text, len(self.text)
+                  while self.pos < size:
+                      char = text[self.pos]
+                      if char in WHITESPACE:
+                          self.pos += 1
+                      elif text.startswith('/*', self.pos):
+                          end = text.find('*/', self.pos + 2)
+                          if end < 0:
+                              raise PlistError('comment that never ends at offset %d' % self.pos)
+                          self.pos = end + 2
+                      elif text.startswith('//', self.pos):
+                          end = text.find('\n', self.pos)
+                          self.pos = size if end < 0 else end + 1
+                      else:
+                          return
+
+              def peek(self):
+                  self.skip()
+                  return self.text[self.pos] if self.pos < len(self.text) else ''
+
+              def take(self, token):
+                  if self.peek() != token:
+                      raise PlistError('expected %r at offset %d, found %r' % (token, self.pos, self.peek()))
+                  self.pos += 1
+
+              def string(self):
+                  self.skip()
+                  text, size = self.text, len(self.text)
+                  if self.pos >= size:
+                      raise PlistError('expected a value at the end of the file')
+                  if text[self.pos] == '"':
+                      out, pos = [], self.pos + 1
+                      while pos < size and text[pos] != '"':
+                          char = text[pos]
+                          if char == '\\':
+                              pos += 1
+                              escape = text[pos] if pos < size else ''
+                              if escape == 'U':
+                                  out.append(chr(int(text[pos + 1:pos + 5], 16)))
+                                  pos += 4
+                              else:
+                                  out.append({'n': '\n', 't': '\t', 'r': '\r'}.get(escape, escape))
+                          else:
+                              out.append(char)
+                          pos += 1
+                      if pos >= size:
+                          raise PlistError('quoted string that never ends at offset %d' % self.pos)
+                      self.pos = pos + 1
+                      return ''.join(out)
+                  start = pos = self.pos
+                  while pos < size and text[pos] not in WHITESPACE and text[pos] not in DELIMITERS and text[pos] != '"':
+                      pos += 1
+                  if pos == start:
+                      raise PlistError('expected a value at offset %d, found %r' % (pos, text[pos:pos + 1]))
+                  self.pos = pos
+                  return text[start:pos]
+
+              def value(self):
+                  char = self.peek()
+                  if char == '{':
+                      self.pos += 1
+                      out = {}
+                      while True:
+                          if self.peek() == '}':
+                              self.pos += 1
+                              return out
+                          key = self.string()
+                          self.take('=')
+                          if key in out:
+                              raise PlistError('%r is defined twice in the same dictionary' % key)
+                          out[key] = self.value()
+                          self.take(';')
+                  if char == '(':
+                      self.pos += 1
+                      out = []
+                      while True:
+                          if self.peek() == ')':
+                              self.pos += 1
+                              return out
+                          out.append(self.value())
+                          if self.peek() == ',':
+                              self.pos += 1
+                          elif self.peek() != ')':
+                              raise PlistError('expected "," or ")" at offset %d, found %r' % (self.pos, self.peek()))
+                  return self.string()
+
+
+          def read_plist(text):
+              scanner = _Scanner(text)
+              value = scanner.value()
+              scanner.skip()
+              if scanner.pos != len(text):
+                  raise PlistError('unexpected %r after the top-level object' % text[scanner.pos:scanner.pos + 1])
+              return value
+
+
+          def items(value):
+              """A property that may be one object or a list, as a list."""
+              return [] if value is None else value if isinstance(value, list) else [value]
+
+
+          # --------------------------------------------------------------------------------------------------
+          # The project file as a list of chunks
+          # --------------------------------------------------------------------------------------------------
+          class Project:
+              """project.pbxproj split into chunks: the objects, and the text between them."""
+
+              def __init__(self, text):
+                  self.chunks = []
+                  starts = list(OBJECT_START.finditer(text))
+                  ends = [match.start() for match in SECTION_END.finditer(text)]
+                  pos = 0
+                  for index, match in enumerate(starts):
+                      if match.start() > pos:
+                          self.chunks.append([None, text[pos:match.start()]])
+                      later = [other.start() for other in starts[index + 1:] if other.start() > match.start()]
+                      candidates = ([later[0]] if later else []) + [end for end in ends if end > match.start()]
+                      end = min(candidates) if candidates else len(text)
+                      self.chunks.append([match.group(1), text[match.start():end]])
+                      pos = end
+                  if pos < len(text):
+                      self.chunks.append([None, text[pos:]])
+                  self.reindex()
+
+              def reindex(self):
+                  self.where = {}
+                  for index, (oid, _chunk) in enumerate(self.chunks):
+                      if oid is not None:
+                          if oid in self.where:
+                              raise RepairError('object %s is defined twice' % oid)
+                          self.where[oid] = index
+
+              def render(self):
+                  return ''.join(chunk for _oid, chunk in self.chunks)
+
+              def has(self, oid):
+                  return oid in self.where
+
+              def text(self, oid):
+                  if oid not in self.where:
+                      raise RepairError('object %s is not in the project file' % oid)
+                  return self.chunks[self.where[oid]][1]
+
+              def objects(self):
+                  return [(oid, chunk) for oid, chunk in self.chunks if oid is not None]
+
+              def replace(self, oid, text):
+                  self.text(oid)
+                  self.chunks[self.where[oid]][1] = text
+
+              def remove(self, oid):
+                  del self.chunks[self.where[oid]]
+                  self.reindex()
+
+              def insert_first(self, section, objects):
+                  """Put [(id, text), ...] in front of the first object of the section named `section`."""
+                  header = '/* Begin %s section */' % section
+                  for index, (oid, chunk) in enumerate(self.chunks):
+                      if oid is None and header in chunk:
+                          before, after = chunk.split(header, 1)
+                          self.chunks[index:index + 1] = [[None, before + header + after]] + [[new, text] for new, text in objects]
+                          self.reindex()
+                          return
+                  raise RepairError('there is no %r section in the project file' % section)
+
+
+          def tabs(block):
+              """The literals below are written with four spaces per level; Xcode writes tabs."""
+              lines = []
+              for line in block.strip('\n').split('\n'):
+                  bare = line.lstrip(' ')
+                  depth = (len(line) - len(bare)) // 4
+                  if line[:len(line) - len(bare)] != '    ' * depth:
+                      raise RepairError('a literal is not indented in steps of four spaces: %r' % line)
+                  lines.append('\t' * depth + bare)
+              return lines
+
+
+          def object_text(oid, comment, body):
+              """A multi-line object. `body` is everything between the braces, one level indented."""
+              inner = ''.join('\t\t' + line + '\n' for line in tabs(body))
+              return '\t\t%s /* %s */ = {\n%s\t\t};\n' % (oid, comment, inner)
+
+
+          def single_line(oid, comment, body):
+              return '\t\t%s /* %s */ = {%s};\n' % (oid, comment, body)
+
+
+          def entry(oid, comment):
+              """One line of a list inside an object: a reference with its comment."""
+              return '\t\t\t\t%s /* %s */,' % (oid, comment)
+
+
+          def add_lines(text, lines, after):
+              """Add lines to an object, right after its line that contains `after`, unless they are there."""
+              present = text.split('\n')
+              missing = [line for line in lines if line not in present]
+              if not missing:
+                  return text
+              positions = [index for index, line in enumerate(present) if after in line]
+              if len(positions) != 1:
+                  raise RepairError('expected exactly one line containing %r, found %d' % (after.strip(), len(positions)))
+              at = positions[0] + 1
+              for line in lines:
+                  if line in present:
+                      at = max(at, present.index(line) + 1)
+              present[at:at] = missing
+              return '\n'.join(present)
+
+
+          def drop_lines(text, needle):
+              """Remove every line of an object that contains `needle`."""
+              return '\n'.join(line for line in text.split('\n') if needle not in line)
+
+
+          def drop_blank_lines(text):
+              return re.sub(r'\n[ \t]*(?=\n)', '\n', text)
+
+
+          # --------------------------------------------------------------------------------------------------
+          # What the kit's objects should say
+          # --------------------------------------------------------------------------------------------------
+          HELPER_SETTINGS = '''
+              BUILD_LIBRARY_FOR_DISTRIBUTION = YES;
+              CLANG_ENABLE_MODULES = YES;
+              CODE_SIGN_IDENTITY = "$(inherited)";
+              CODE_SIGN_STYLE = Automatic;
+              CURRENT_PROJECT_VERSION = 1;
+              DEFINES_MODULE = YES;
+              DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
+              DYLIB_COMPATIBILITY_VERSION = 1;
+              DYLIB_CURRENT_VERSION = 1;
+              DYLIB_INSTALL_NAME_BASE = "@rpath";
+              ENABLE_MODULE_VERIFIER = YES;
+              ENABLE_USER_SCRIPT_SANDBOXING = YES;
+              "EXCLUDED_SOURCE_FILE_NAMES[sdk=iphoneos*]" = SimulatorStub.c;
+              "EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = "*";
+              "FRAMEWORK_SEARCH_PATHS[sdk=iphoneos*]" = "$(SRCROOT)/StikJITHeadless/StikJIT.xcframework/ios-arm64";
+              GENERATE_INFOPLIST_FILE = YES;
+              "INCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = SimulatorStub.c;
+              INFOPLIST_KEY_NSHumanReadableCopyright = "";
+              INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
+              IPHONEOS_DEPLOYMENT_TARGET = 17.4;
+              LD_RUNPATH_SEARCH_PATHS = (
+                  "$(inherited)",
+                  "@executable_path/Frameworks",
+                  "@loader_path/Frameworks",
+              );
+              MARKETING_VERSION = 1.0;
+              MODULE_VERIFIER_SUPPORTED_LANGUAGES = "objective-c objective-c++";
+              MODULE_VERIFIER_SUPPORTED_LANGUAGE_STANDARDS = "gnu17 gnu++20";
+              PRODUCT_BUNDLE_IDENTIFIER = com.kdt.StikJITHeadless;
+              PRODUCT_NAME = "$(TARGET_NAME:c99extidentifier)";
+              SKIP_INSTALL = YES;
+              STRING_CATALOG_GENERATE_SYMBOLS = YES;
+              SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+              SWIFT_APPROACHABLE_CONCURRENCY = YES;
+              SWIFT_EMIT_LOC_STRINGS = YES;
+              SWIFT_INSTALL_MODULE = YES;
+              SWIFT_INSTALL_OBJC_HEADER = NO;
+              SWIFT_OBJC_BRIDGING_HEADER = "";
+              SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+              SWIFT_VERSION = 5.0;
+              TARGETED_DEVICE_FAMILY = "1,2";
+              VERSIONING_SYSTEM = "apple-generic";
+              VERSION_INFO_PREFIX = "";
+          '''
+
+          VPN_SETTINGS = '''
+              CLANG_ENABLE_MODULES = YES;
+              CODE_SIGN_ENTITLEMENTS = LoopbackVPN/LoopbackVPN.entitlements;
+              CODE_SIGN_IDENTITY = "$(inherited)";
+              CODE_SIGN_STYLE = Automatic;
+              CURRENT_PROJECT_VERSION = 1;
+              DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
+              ENABLE_USER_SCRIPT_SANDBOXING = YES;
+              GENERATE_INFOPLIST_FILE = NO;
+              INFOPLIST_FILE = LoopbackVPN/Info.plist;
+              IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+              LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", );
+              MARKETING_VERSION = 1.0;
+              PRODUCT_BUNDLE_IDENTIFIER = "$(LIVECONTAINER_BUNDLE_IDENTIFIER).LoopbackVPN";
+              PRODUCT_NAME = "$(TARGET_NAME)";
+              SKIP_INSTALL = YES;
+              SWIFT_EMIT_LOC_STRINGS = YES;
+              SWIFT_VERSION = 5.0;
+              TARGETED_DEVICE_FAMILY = "1,2";
+          '''
+
+
+          def configuration(oid, name, settings, xcconfig):
+              base = ('    baseConfigurationReferenceAnchor = %s /* xcconfigs */;\n'
+                      '    baseConfigurationReferenceRelativePath = %s;\n' % (XCCONFIGS_GROUP, xcconfig))
+              return object_text(oid, name, '    isa = XCBuildConfiguration;\n' + base + '    buildSettings = {\n'
+                                 + settings.strip('\n') + '\n    };\n    name = %s;' % name)
+
+
+          def empty_phase(oid, comment, isa):
+              return object_text(oid, comment, '    isa = %s;\n    buildActionMask = 2147483647;\n    files = (\n    );\n    runOnlyForDeploymentPostprocessing = 0;' % isa)
+
+
+          def expected_objects():
+              """The text of every object the kit owns, by ID."""
+              return {
+                  HELPER_SOURCES: empty_phase(HELPER_SOURCES, 'Sources', 'PBXSourcesBuildPhase'),
+                  HELPER_RESOURCES: empty_phase(HELPER_RESOURCES, 'Resources', 'PBXResourcesBuildPhase'),
+                  HELPER_DEBUG: configuration(HELPER_DEBUG, 'Debug', HELPER_SETTINGS.replace(
+                      '    SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY', '    SWIFT_OPTIMIZATION_LEVEL = "-Onone";\n    SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY'), HELPER_XCCONFIG),
+                  HELPER_RELEASE: configuration(HELPER_RELEASE, 'Release', HELPER_SETTINGS, HELPER_XCCONFIG),
+                  VPN_DEBUG: configuration(VPN_DEBUG, 'Debug', VPN_SETTINGS, VPN_XCCONFIG),
+                  VPN_RELEASE: configuration(VPN_RELEASE, 'Release', VPN_SETTINGS, VPN_XCCONFIG),
+                  VPN_GROUP: single_line(VPN_GROUP, 'LoopbackVPN', 'isa = PBXFileSystemSynchronizedRootGroup; exceptions = (%s /* PBXFileSystemSynchronizedBuildFileExceptionSet */, ); explicitFileTypes = {}; explicitFolders = (); path = LoopbackVPN; sourceTree = "<group>";' % VPN_EXCEPTIONS),
+                  VPN_EXCEPTIONS: object_text(VPN_EXCEPTIONS, 'PBXFileSystemSynchronizedBuildFileExceptionSet',
+                                               '    isa = PBXFileSystemSynchronizedBuildFileExceptionSet;\n    membershipExceptions = (\n        Info.plist,\n    );\n    target = %s /* LoopbackVPN */;' % VPN_TARGET),
+                  VPN_IN_EMBED: single_line(VPN_IN_EMBED, 'LoopbackVPN.appex in Embed Foundation Extensions',
+                                            'isa = PBXBuildFile; fileRef = %s /* LoopbackVPN.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); };' % VPN_PRODUCT),
+                  STIKJIT: single_line(STIKJIT, 'StikJIT.framework', 'isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = StikJIT.framework; path = "StikJITHeadless/StikJIT.xcframework/ios-arm64/StikJIT.framework"; sourceTree = "<group>";'),
+                  STIKJIT_LINK: single_line(STIKJIT_LINK, 'StikJIT.framework in Frameworks', 'isa = PBXBuildFile; fileRef = %s /* StikJIT.framework */;' % STIKJIT),
+                  STIKJIT_IN_EMBED: single_line(STIKJIT_IN_EMBED, 'StikJIT.framework in Embed Frameworks', 'isa = PBXBuildFile; fileRef = %s /* StikJIT.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); };' % STIKJIT),
+                  PAIRING: single_line(PAIRING, 'IdevicePairing.dylib', 'isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; name = IdevicePairing.dylib; path = IdevicePairing/IdevicePairing.dylib; sourceTree = "<group>";'),
+                  PAIRING_IN_EMBED: single_line(PAIRING_IN_EMBED, 'IdevicePairing.dylib in Embed Frameworks', 'isa = PBXBuildFile; fileRef = %s /* IdevicePairing.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); };' % PAIRING),
+              }
+
+
+          # Where an object goes when it is missing: its section, in the order it is written there.
+          NEW_OBJECTS = (
+              ('PBXResourcesBuildPhase', (HELPER_RESOURCES,)),
+              ('PBXSourcesBuildPhase', (HELPER_SOURCES,)),
+              ('XCBuildConfiguration', (HELPER_DEBUG, HELPER_RELEASE)),
+              ('PBXFileSystemSynchronizedBuildFileExceptionSet', (VPN_EXCEPTIONS,)),
+              ('PBXBuildFile', (STIKJIT_IN_EMBED,)),
+          )
+
+
+          # --------------------------------------------------------------------------------------------------
+          # repair
+          # --------------------------------------------------------------------------------------------------
+          def repair(root):
+              """Bring <root>/LiveContainer.xcodeproj/project.pbxproj, and the two xcconfig files its new
+              targets read, into the state the kit needs."""
+              path = os.path.join(root, 'LiveContainer.xcodeproj', 'project.pbxproj')
+              notes = []
+              with open(path, encoding='utf-8') as handle:
+                  original = handle.read()
+              project = Project(original)
+              if not (project.has(VPN_TARGET) and project.has(HELPER_TARGET)):
+                  print('repair: the FlekJIT targets are not in this project file, so there is nothing to repair')
+                  return 0
+
+              # 0. Each of the kit's targets takes its base settings from its own xcconfig.
+              if not (project.has(XCCONFIGS_GROUP) and 'path = xcconfigs;' in project.text(XCCONFIGS_GROUP)):
+                  raise RepairError('the project has no "xcconfigs" folder for the targets to take settings from')
+              for name, text in XCCONFIGS.items():
+                  target = os.path.join(root, 'xcconfigs', name)
+                  if not os.path.isfile(target):
+                      with open(target, 'w', encoding='utf-8') as handle:
+                          handle.write(text)
+                      notes.append('wrote xcconfigs/%s' % name)
+
+              def edit(oid, text, note):
+                  if text != project.text(oid):
+                      project.replace(oid, text)
+                      notes.append(note)
+
+              # 1. Every container item proxy points at the project object.
+              projects = [oid for oid, text in project.objects() if '\n\t\t\tisa = PBXProject;' in text]
+              if len(projects) != 1:
+                  raise RepairError('found %d PBXProject objects, expected 1' % len(projects))
+              for oid, text in project.objects():
+                  if '\n\t\t\tisa = PBXContainerItemProxy;' in text:
+                      edit(oid, re.sub(r'containerPortal = (?:%s)(?: /\*.*?\*/)?;' % HEX24,
+                                       'containerPortal = %s /* Project object */;' % projects[0], text),
+                           '%s pointed somewhere other than the project object' % oid)
+
+              # 2. The old copy phase for the VPN extension goes; the objects that were referenced
+              #    but never written come in.
+              if project.has(OLD_EMBED_PHASE) and 'isa = PBXCopyFilesBuildPhase;' in project.text(OLD_EMBED_PHASE):
+                  project.remove(OLD_EMBED_PHASE)
+                  notes.append('removed the "Embed App Extensions" phase, which put the VPN extension where iOS does not look')
+              wanted = expected_objects()
+              for section, oids in NEW_OBJECTS:
+                  missing = [(oid, wanted[oid]) for oid in oids if not project.has(oid)]
+                  if missing:
+                      project.insert_first(section, missing)
+                      notes.append('wrote the missing object %s' % ', '.join(oid for oid, _text in missing))
+
+              # 3. The kit's own objects say what they should.
+              for oid, text in wanted.items():
+                  if project.has(oid):
+                      edit(oid, text, 'rewrote %s' % oid)
+
+              # 4. The VPN extension goes where iOS looks for extensions, next to the others.
+              edit(EMBED_EXTENSIONS,
+                   add_lines(project.text(EMBED_EXTENSIONS), [entry(VPN_IN_EMBED, 'LoopbackVPN.appex in Embed Foundation Extensions')],
+                             entry('17E23DE92F443A9300C55733', 'ShareExtension.appex in Embed Foundation Extensions')),
+                   'LoopbackVPN.appex was not in the "Embed Foundation Extensions" phase')
+              app = drop_lines(project.text(APP), OLD_EMBED_PHASE)
+              edit(APP, drop_blank_lines(app), 'the app target no longer has the old copy phase')
+
+              # 5. The helper framework, StikJIT and the pairing library travel inside the app.
+              edit(EMBED_FRAMEWORKS,
+                   add_lines(project.text(EMBED_FRAMEWORKS), [entry(STIKJIT_IN_EMBED, 'StikJIT.framework in Embed Frameworks'),
+                                                              entry(PAIRING_IN_EMBED, 'IdevicePairing.dylib in Embed Frameworks')],
+                             entry(HELPER_IN_EMBED, 'StikJITHeadless.framework in Embed Frameworks')),
+                   'StikJIT.framework or IdevicePairing.dylib was not copied into the app')
+              edit(VPN_RESOURCES, drop_lines(project.text(VPN_RESOURCES), PAIRING_IN_EMBED),
+                   'IdevicePairing.dylib was a resource of the VPN extension')
+              edit(FRAMEWORKS_GROUP,
+                   add_lines(project.text(FRAMEWORKS_GROUP), [entry(STIKJIT, 'StikJIT.framework'), entry(PAIRING, 'IdevicePairing.dylib')],
+                             entry('17554B712DA16988004C6D90', 'OpenSSL.xcframework')),
+                   'StikJIT.framework or IdevicePairing.dylib was in no group, so its path could not be found')
+
+              # 6. The project knows its new targets: the targets list, the main group, the products group.
+              edit(PROJECT, add_lines(project.text(PROJECT), [entry(HELPER_TARGET, 'StikJITHeadless'), entry(VPN_TARGET, 'LoopbackVPN')],
+                                      entry('17E23DDE2F443A9300C55733', 'ShareExtension')),
+                   'the targets list did not name LoopbackVPN and StikJITHeadless')
+              edit(MAIN_GROUP, add_lines(project.text(MAIN_GROUP), [entry(HELPER_GROUP, 'StikJITHeadless'), entry(VPN_GROUP, 'LoopbackVPN')],
+                                         entry('17E23DE02F443A9300C55733', 'ShareExtension')),
+                   'the main group did not contain the LoopbackVPN and StikJITHeadless folders')
+              edit(PRODUCTS, add_lines(project.text(PRODUCTS), [entry(HELPER_PRODUCT, 'StikJITHeadless.framework'), entry(VPN_PRODUCT, 'LoopbackVPN.appex')],
+                                       entry('17E23DDF2F443A9300C55733', 'ShareExtension.appex')),
+                   'the products group did not name the new products')
+
+              result = project.render()
+              if result != original:
+                  read_plist(result)      # never leave behind something that does not read back
+                  with open(path, 'w', encoding='utf-8') as handle:
+                      handle.write(result)
+                  notes.insert(0, 'the project file (%d objects) needed changes' % len(project.where))
+              if not notes:
+                  print('repair: the project is already as the kit needs it')
+                  return 0
+              print('repair: made %d change(s):' % len(notes))
+              for note in notes:
+                  print('  - ' + note)
+              return 0
+
+
+          # --------------------------------------------------------------------------------------------------
+          # check
+          # --------------------------------------------------------------------------------------------------
+          TARGETS = ('PBXNativeTarget', 'PBXAggregateTarget', 'PBXLegacyTarget')
+          PHASES = ('PBXSourcesBuildPhase', 'PBXFrameworksBuildPhase', 'PBXResourcesBuildPhase', 'PBXCopyFilesBuildPhase',
+                    'PBXHeadersBuildPhase', 'PBXShellScriptBuildPhase', 'PBXRezBuildPhase')
+          GROUP_CHILDREN = ('PBXFileReference', 'PBXGroup', 'PBXVariantGroup', 'PBXReferenceProxy', 'PBXFileSystemSynchronizedRootGroup',
+                            'XCVersionGroup', 'XCLocalSwiftPackageReference', 'XCRemoteSwiftPackageReference')
+          EDGES = {   # (kind of object, property) -> the kinds its value or values may have
+              ('PBXBuildFile', 'fileRef'): ('PBXFileReference', 'PBXVariantGroup', 'PBXReferenceProxy'),
+              ('PBXContainerItemProxy', 'containerPortal'): ('PBXProject', 'PBXGroup', 'PBXFileReference'),
+              ('PBXContainerItemProxy', 'remoteGlobalIDString'): TARGETS,
+              ('PBXTargetDependency', 'target'): TARGETS,
+              ('PBXTargetDependency', 'targetProxy'): ('PBXContainerItemProxy',),
+              ('PBXNativeTarget', 'buildPhases'): PHASES,
+              ('PBXNativeTarget', 'dependencies'): ('PBXTargetDependency',),
+              ('PBXNativeTarget', 'productReference'): ('PBXFileReference',),
+              ('PBXNativeTarget', 'buildConfigurationList'): ('XCConfigurationList',),
+              ('PBXNativeTarget', 'fileSystemSynchronizedGroups'): ('PBXFileSystemSynchronizedRootGroup',),
+              ('PBXNativeTarget', 'packageProductDependencies'): ('XCSwiftPackageProductDependency',),
+              ('PBXAggregateTarget', 'buildPhases'): PHASES,
+              ('PBXAggregateTarget', 'dependencies'): ('PBXTargetDependency',),
+              ('PBXProject', 'buildConfigurationList'): ('XCConfigurationList',),
+              ('PBXProject', 'mainGroup'): ('PBXGroup',),
+              ('PBXProject', 'productRefGroup'): ('PBXGroup',),
+              ('PBXProject', 'targets'): TARGETS,
+              ('XCConfigurationList', 'buildConfigurations'): ('XCBuildConfiguration',),
+              ('XCBuildConfiguration', 'baseConfigurationReference'): ('PBXFileReference',),
+              ('PBXFileSystemSynchronizedRootGroup', 'exceptions'): ('PBXFileSystemSynchronizedBuildFileExceptionSet',
+                                                                    'PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet'),
+              ('PBXFileSystemSynchronizedBuildFileExceptionSet', 'target'): TARGETS,
+              ('PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet', 'target'): TARGETS,
+              ('PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet', 'buildPhase'): PHASES,
+              ('PBXGroup', 'children'): GROUP_CHILDREN,
+              ('PBXVariantGroup', 'children'): ('PBXFileReference',),
+          }
+          FILES_OF = ('PBXSourcesBuildPhase', 'PBXFrameworksBuildPhase', 'PBXResourcesBuildPhase', 'PBXCopyFilesBuildPhase',
+                      'PBXHeadersBuildPhase', 'PBXRezBuildPhase')
+          KIT_FILES = ('LiveContainerSwiftUI/FlekDeckJIT/FlekLoopbackVPN.swift',
+                       'LiveContainerSwiftUI/FlekDeckJIT/FlekJITSetup.swift',
+                       'LiveContainerSwiftUI/FlekDeckJIT/FlekBuiltInJITSection.swift',
+                       'LoopbackVPN/Info.plist', 'LoopbackVPN/LoopbackTunnelProvider.swift', 'LoopbackVPN/LoopbackVPN.entitlements',
+                       'StikJITHeadless/StikJITHeadless.swift', 'StikJITHeadless/main.m', 'IdevicePairing/IdevicePairing.dylib',
+                       'xcconfigs/' + VPN_XCCONFIG, 'xcconfigs/' + HELPER_XCCONFIG)
+
+
+          class Checker:
+              def __init__(self, root):
+                  self.root = root
+                  self.problems = []
+                  self.objects = {}
+
+              def problem(self, message):
+                  self.problems.append(message)
+
+              def obj(self, oid):
+                  return self.objects.get(oid) if isinstance(self.objects.get(oid), dict) else {}
+
+              def kind(self, oid):
+                  return self.obj(oid).get('isa')
+
+              def label(self, oid):
+                  obj = self.obj(oid)
+                  if not obj:
+                      return '%s (not defined)' % oid
+                  for key in ('name', 'path', 'productName'):
+                      if isinstance(obj.get(key), str):
+                          return '%s /* %s */' % (oid, obj[key])
+                  return '%s /* %s */' % (oid, obj.get('isa'))
+
+              def graph(self):
+                  """Every reference resolves, to an object of the kind its property asks for."""
+                  root = self.data.get('rootObject')
+                  if self.kind(root) != 'PBXProject':
+                      self.problem('rootObject %s is not a PBXProject' % self.label(root))
+                      return None
+                  for oid, obj in self.objects.items():
+                      if not isinstance(obj, dict) or not isinstance(obj.get('isa'), str):
+                          self.problem('%s has no isa, so nothing can refer to it' % oid)
+                  for oid, obj in self.objects.items():
+                      if not isinstance(obj, dict):
+                          continue
+                      for (owner, prop), allowed in EDGES.items():
+                          if obj.get('isa') != owner:
+                              continue
+                          for value in items(obj.get(prop)):
+                              found = self.kind(value)
+                              if found is None:
+                                  self.problem('%s: %s refers to %s, which is not defined' % (self.label(oid), prop, value))
+                              elif found not in allowed:
+                                  self.problem('%s: %s refers to %s, which is a %s, not one of: %s'
+                                               % (self.label(oid), prop, value, found, ', '.join(allowed)))
+                      if obj.get('isa') in FILES_OF:
+                          for value in items(obj.get('files')):
+                              found = self.kind(value)
+                              if found is None:
+                                  self.problem('%s: files refers to %s, which is not defined' % (self.label(oid), value))
+                              elif found != 'PBXBuildFile':
+                                  self.problem('%s: files refers to %s, which is a %s, not a build file' % (self.label(oid), value, found))
+                  return root
+
+              def parents(self, root):
+                  """For everything under a group: the group it is in."""
+                  parent = {self.obj(root).get('mainGroup'): None}
+                  changed = True
+                  while changed:
+                      changed = False
+                      for oid, obj in self.objects.items():
+                          if isinstance(obj, dict) and obj.get('isa') == 'PBXGroup' and oid in parent:
+                              for child in items(obj.get('children')):
+                                  if child not in parent:
+                                      parent[child] = oid
+                                      changed = True
+                  return parent
+
+              def path(self, oid, parent):
+                  """Where a file reference is on disk, or None when it does not resolve under the project."""
+                  parts, seen = [], set()
+                  while oid is not None and oid not in seen:
+                      seen.add(oid)
+                      obj = self.obj(oid)
+                      if obj.get('sourceTree', '<group>') in ('BUILT_PRODUCTS_DIR', '<absolute>', 'SDKROOT'):
+                          return None
+                      if isinstance(obj.get('path'), str):
+                          parts.append(obj['path'])
+                      oid = parent.get(oid)
+                  return os.path.join(self.root, *reversed(parts)) if parts else None
+
+              def kit(self, root):
+                  named = {}
+                  for oid in items(self.obj(root).get('targets')):
+                      if self.kind(oid) == 'PBXNativeTarget':
+                          named.setdefault(self.obj(oid).get('name'), oid)
+                  for oid, name in KIT_TARGETS.items():
+                      if named.get(name) != oid:
+                          self.problem('target %s is not in the project\'s targets list, so xcodebuild never builds it' % name)
+
+                  app = self.obj(APP)
+                  parent = self.parents(root)
+
+                  def copied(spec):
+                      """Last path components of what the app's copy phases with this destination folder hold."""
+                      out = []
+                      for phase in items(app.get('buildPhases')):
+                          obj = self.obj(phase)
+                          if obj.get('isa') == 'PBXCopyFilesBuildPhase' and str(obj.get('dstSubfolderSpec')) == str(spec) and not obj.get('dstPath'):
+                              for build_file in items(obj.get('files')):
+                                  reference = self.obj(self.obj(build_file).get('fileRef'))
+                                  out.append(os.path.basename(str(reference.get('path') or reference.get('name'))))
+                      return out
+
+                  if 'LoopbackVPN.appex' not in copied(13):
+                      self.problem('LoopbackVPN.appex is not in the app\'s "Embed Foundation Extensions" phase, so it would not land in PlugIns/')
+                  frameworks = copied(10)
+                  for name in ('StikJITHeadless.framework', 'StikJIT.framework', 'IdevicePairing.dylib'):
+                      if name not in frameworks:
+                          self.problem('%s is not in the app\'s "Embed Frameworks" phase, so the app could not load it' % name)
+                  depends = [self.obj(self.obj(dep).get('target')).get('name') for dep in items(app.get('dependencies'))]
+                  for name in KIT_TARGETS.values():
+                      if name not in depends:
+                          self.problem('the LiveContainer target does not depend on %s' % name)
+                  main_group = self.obj(root).get('mainGroup')
+                  for oid in (VPN_GROUP, HELPER_GROUP):
+                      if parent.get(oid) != main_group:
+                          self.problem('%s is not in the main group, so its folder cannot be found' % self.label(oid))
+                  for oid in (STIKJIT, PAIRING):
+                      if oid not in parent:
+                          self.problem('%s is in no group, so its path cannot be found' % self.label(oid))
+                  stikjit = self.path(STIKJIT, parent)
+                  if not stikjit or not os.path.isfile(os.path.join(stikjit, 'StikJIT')):
+                      self.problem('StikJIT.framework was not found on disk at %s' % os.path.join(str(stikjit), 'StikJIT'))
+                  pairing = self.path(PAIRING, parent)
+                  if not pairing or not os.path.isfile(pairing):
+                      self.problem('IdevicePairing.dylib was not found on disk at %s' % pairing)
+
+                  exceptions = []
+                  for exception_set in items(self.obj(VPN_GROUP).get('exceptions')):
+                      exceptions += items(self.obj(exception_set).get('membershipExceptions'))
+                  if 'Info.plist' not in exceptions:
+                      self.problem('LoopbackVPN/Info.plist is not left out of the target, so Xcode would copy it twice')
+
+                  with open(os.path.join(self.root, 'LoopbackVPN', 'Info.plist'), 'rb') as handle:
+                      extension = plistlib.load(handle).get('NSExtension', {})
+                  if extension.get('NSExtensionPointIdentifier') != 'com.apple.networkextension.packet-tunnel':
+                      self.problem('LoopbackVPN/Info.plist does not declare a packet tunnel extension')
+                  if not extension.get('NSExtensionPrincipalClass'):
+                      self.problem('LoopbackVPN/Info.plist names no class to run the tunnel')
+
+                  # Each of the kit's targets takes its base settings from its own xcconfig, as the other
+                  # targets of this project do: Global.xcconfig holds the team and the bundle ID prefix.
+                  if not (self.kind(XCCONFIGS_GROUP) == 'PBXFileSystemSynchronizedRootGroup'
+                          and self.obj(XCCONFIGS_GROUP).get('path') == 'xcconfigs'):
+                      self.problem('%s, the "xcconfigs" folder, is not in the project' % self.label(XCCONFIGS_GROUP))
+                  for oid, name in ((VPN_DEBUG, VPN_XCCONFIG), (VPN_RELEASE, VPN_XCCONFIG),
+                                    (HELPER_DEBUG, HELPER_XCCONFIG), (HELPER_RELEASE, HELPER_XCCONFIG)):
+                      config = self.obj(oid)
+                      if not (config.get('baseConfigurationReferenceAnchor') == XCCONFIGS_GROUP
+                              and config.get('baseConfigurationReferenceRelativePath') == name):
+                          self.problem('%s does not take its settings from xcconfigs/%s, so it has neither a team nor a bundle ID prefix'
+                                       % (self.label(oid), name))
+                      elif not os.path.isfile(os.path.join(self.root, 'xcconfigs', name)):
+                          self.problem('xcconfigs/%s, which %s reads, is missing' % (name, self.label(oid)))
+
+                  for oid in (VPN_DEBUG, VPN_RELEASE):
+                      settings = self.obj(oid).get('buildSettings')
+                      if not isinstance(settings, dict):
+                          self.problem('%s has no build settings' % self.label(oid))
+                          continue
+                      for key in ('CODE_SIGN_ENTITLEMENTS', 'INFOPLIST_FILE', 'PRODUCT_BUNDLE_IDENTIFIER', 'SWIFT_VERSION'):
+                          if key not in settings:
+                              self.problem('%s has no %s' % (self.label(oid), key))
+                      entitlements = settings.get('CODE_SIGN_ENTITLEMENTS')
+                      if isinstance(entitlements, str):
+                          with open(os.path.join(self.root, entitlements), 'rb') as handle:
+                              allowed = plistlib.load(handle).get('com.apple.developer.networking.networkextension')
+                          if not allowed or 'packet-tunnel-provider' not in allowed:
+                              self.problem('%s does not ask for the packet-tunnel-provider entitlement' % entitlements)
+
+                  bundle = settings.get('PRODUCT_BUNDLE_IDENTIFIER') if isinstance(settings, dict) else None
+                  if isinstance(bundle, str) and '.LoopbackVPN' in bundle:
+                      # The tunnel has to be a child of the app's identifier, and the app keeps the prefix
+                      # it shares with its other extensions.
+                      identifier = bundle.replace('.LoopbackVPN', '')
+                      if identifier not in ('$(LIVECONTAINER_BUNDLE_IDENTIFIER)', '$(PRODUCT_BUNDLE_IDENTIFIER)'):
+                          self.problem('the tunnel\'s bundle identifier starts from %r, which is not the app\'s' % identifier)
+
+              def run(self):
+                  path = os.path.join(self.root, 'LiveContainer.xcodeproj', 'project.pbxproj')
+                  try:
+                      with open(path, encoding='utf-8') as handle:
+                          text = handle.read()
+                  except OSError as error:
+                      self.problem('cannot read the project file: %s' % error)
+                      text = ''
+                  if text:
+                      try:
+                          self.data = read_plist(text)
+                      except PlistError as error:
+                          self.problem('the project file is not a readable property list (%s), which is where xcodebuild stops' % error)
+                      else:
+                          self.objects = self.data.get('objects')
+                          if not isinstance(self.objects, dict):
+                              self.problem('the project file has no table of objects')
+                              text = ''
+                  if text:
+                      root = self.graph()
+                      if root is not None and all(self.obj(oid) for oid in (APP, VPN_TARGET, HELPER_TARGET, VPN_GROUP)):
+                          try:
+                              self.kit(root)
+                          except (OSError, plistlib.InvalidFileException, ValueError, AttributeError, KeyError, TypeError) as error:
+                              self.problem('the kit\'s part of the project could not be checked (%s: %s)' % (type(error).__name__, error))
+                  for name in KIT_FILES:
+                      if not os.path.isfile(os.path.join(self.root, name)):
+                          self.problem('%s is missing, so the patch that adds it was not applied' % name)
+                  for message in self.problems:
+                      print('problem: ' + message)
+                  if self.problems:
+                      print('%d problem(s) in the project' % len(self.problems))
+                      return 1
+                  print('project file OK: %d objects; targets: %s' % (len(self.objects), ', '.join(
+                      str(self.obj(oid).get('name')) for oid in items(self.obj(self.data.get('rootObject')).get('targets')))))
+                  return 0
+
+
+          def main(argv):
+              if len(argv) == 3 and argv[1] == 'repair':
+                  return repair(argv[2])
+              if len(argv) == 3 and argv[1] == 'check':
+                  return Checker(argv[2]).run()
+              sys.stderr.write(__doc__)
+              return 2
+
+
+          if __name__ == '__main__':
+              try:
+                  sys.exit(main(sys.argv))
+              except RepairError as error:
+                  print('problem: %s' % error)
+                  sys.exit(1)
+          FLEKJIT_PROJECT_PY
+          if ! python3 /tmp/flekjit_project.py check "$GITHUB_WORKSPACE"; then
+            echo "::warning::The FlekJIT project file needed repairs (the project patch in this fork is an older copy). It was repaired in place."
+            python3 /tmp/flekjit_project.py repair "$GITHUB_WORKSPACE"
+          fi
+          python3 /tmp/flekjit_project.py check "$GITHUB_WORKSPACE"
 
       - name: Prepare Dependencies
-        run: sh .github/prepare_dependencies.sh
 
       - name: Archive
         run: |
@@ -84,23 +942,76 @@ jobs:
             -sdk iphoneos -arch arm64 -configuration Release 2>&1 | tee build.log | tail -60
           grep -q "ARCHIVE SUCCEEDED" build.log || { echo "::error::archive failed"; tail -120 build.log; exit 1; }
 
-      - name: Sign entitlement-bearing binaries (ldid)
+      - name: Sign for the VPN (ldid)
         run: |
           set -eu
           brew install ldid
           APP="$archive_path.xcarchive/Products/Applications/LiveContainer.app"
           [ -d "$APP" ] || { echo "::error::LiveContainer.app missing from archive"; exit 1; }
-          ldid -S".github/flekjit/entitlements-app.xml" "$APP/LiveContainer"
-          ldid -S".github/flekjit/entitlements-app.xml" "$APP/PlugIns/LiveProcess.appex/LiveProcess"
-          ldid -S".github/flekjit/entitlements-vpn.xml" "$APP/PlugIns/LoopbackVPN.appex/LoopbackVPN"
-          ldid -S".github/flekjit/entitlements-vpn.xml" "$APP/Frameworks/StikJITHeadless.framework/StikJITHeadless"
-          ldid -S"" "$APP/Frameworks/IdevicePairing.dylib"
-          for f in "$APP/LiveContainer" "$APP/PlugIns/LiveProcess.appex/LiveProcess"; do
-            ldid -e "$f" > /tmp/ent.plist
-            grep -q "application-groups" /tmp/ent.plist || { echo "::error::app groups missing on $f"; exit 1; }
-            grep -q "keychain-access-groups" /tmp/ent.plist || { echo "::error::keychain groups missing on $f"; exit 1; }
+          BIN="$APP/LiveContainer"
+          TUNNEL="$APP/PlugIns/LoopbackVPN.appex/LoopbackVPN"
+
+          # 1) What the patches add has to be inside the app: the packet tunnel (the part
+          # of LocalDevVPN that is built in), the JIT helper, and its two libraries.
+          for p in "PlugIns/LoopbackVPN.appex/LoopbackVPN" "Frameworks/StikJITHeadless.framework/StikJITHeadless" \
+                   "Frameworks/StikJIT.framework/StikJIT" "Frameworks/IdevicePairing.dylib"; do
+            [ -e "$APP/$p" ] || { echo "::error::$p is missing from the archive — the project file does not build it in"; exit 1; }
           done
-          echo "entitlements verified (groups + 128 keychain groups)"
+
+          entitlements() { # what a binary is signed with now, as XML
+            ldid -e "$1" 2>/dev/null || true
+          }
+
+          # 2) The tunnel needs packet-tunnel-provider. Xcode signs it with
+          # LoopbackVPN/LoopbackVPN.entitlements; sign it again only if that is not there.
+          if ! entitlements "$TUNNEL" | grep -q packet-tunnel-provider; then
+            cat > /tmp/flekjit-tunnel.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <plist version="1.0"><dict>
+              <key>com.apple.developer.networking.networkextension</key>
+              <array><string>packet-tunnel-provider</string></array>
+          </dict></plist>
+          XML
+            ldid -S"/tmp/flekjit-tunnel.xml" "$TUNNEL"
+          fi
+
+          # 3) The app itself needs the same key to switch its own VPN on (the stock
+          # LiveContainer entitlements do not have it). Start from what Xcode signed the
+          # app with — its app groups and 128 keychain groups stay as they are — and add
+          # the VPN keys. (SideStore keeps only what the user's profile allows, so this
+          # changes nothing for a free Apple ID, and is what a paid account needs.)
+          entitlements "$BIN" > /tmp/flekjit-app.xml
+          if ! grep -q "<key>application-identifier</key>" /tmp/flekjit-app.xml; then
+            codesign -d --entitlements :- "$BIN" 2>/dev/null | sed -E 's/^(\[Dict\]|\[Key\]|\[Value\])//' > /tmp/flekjit-app.xml
+          fi
+          plutil -lint /tmp/flekjit-app.xml
+          python3 - <<'PY'
+          import plistlib
+          path = '/tmp/flekjit-app.xml'
+          with open(path, 'rb') as f:
+              ent = plistlib.load(f)
+          def add(key, value):
+              have = ent.get(key, [])
+              have = [have] if isinstance(have, str) else list(have)
+              ent[key] = list(dict.fromkeys(have + [value]))
+          add('com.apple.developer.networking.networkextension', 'packet-tunnel-provider')
+          add('com.apple.developer.networking.vpn.api', 'allow-vpn')
+          with open(path, 'wb') as f:
+              plistlib.dump(ent, f, fmt=plistlib.FMT_XML)
+          PY
+          ldid -S"/tmp/flekjit-app.xml" "$BIN"
+
+          # 4) Verify: groups on app and LiveProcess, the VPN key on app and tunnel.
+          for f in "$BIN" "$APP/PlugIns/LiveProcess.appex/LiveProcess"; do
+            entitlements "$f" > /tmp/flekjit-have.xml
+            grep -q "application-groups" /tmp/flekjit-have.xml || { echo "::error::app groups missing on $f"; exit 1; }
+            grep -q "keychain-access-groups" /tmp/flekjit-have.xml || { echo "::error::keychain groups missing on $f"; exit 1; }
+          done
+          entitlements "$TUNNEL" | grep -q packet-tunnel-provider || { echo "::error::the VPN tunnel is not signed with packet-tunnel-provider"; exit 1; }
+          entitlements "$BIN" | grep -q packet-tunnel-provider || { echo "::error::the app is not signed with packet-tunnel-provider"; exit 1; }
+          # A library is never asked for entitlements; it only has to be signed.
+          ldid -S"" "$APP/Frameworks/IdevicePairing.dylib"
+          echo "entitlements verified: app groups, keychain groups, and the VPN (packet tunnel) on the app and its tunnel"
 
       - name: Create plain IPA (LiveContainer-flekjit.ipa)
         run: |
