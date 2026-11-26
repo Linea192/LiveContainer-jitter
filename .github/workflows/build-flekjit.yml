@@ -934,6 +934,7 @@ jobs:
           python3 /tmp/flekjit_project.py check "$GITHUB_WORKSPACE"
 
       - name: Prepare Dependencies
+        run: sh .github/prepare_dependencies.sh
 
       - name: Archive
         run: |
