@@ -939,19 +939,39 @@ jobs:
       - name: Archive
         run: |
           set -o pipefail
+          # Full log to build.log (artifact + in-step error printing below). The web UI truncates
+          # long steps from the TOP, so the actual compiler error above the "ARCHIVE FAILED" footer
+          # is usually invisible; every block below exists to re-print it at the very end.
           xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -project LiveContainer.xcodeproj \
-            -sdk iphoneos -arch arm64 -configuration Release 2>&1 | tee build.log | tail -30
-          grep -q "ARCHIVE SUCCEEDED" build.log || {
-            echo "::error::archive failed"
-            echo "----- every error and note in build.log, with context -----"
-            grep -nE "error:|note:|fatal error" build.log | tail -100
-            echo "----- context around the first error -----"
-            first=$(grep -nE "error:|fatal error" build.log | head -1 | cut -d: -f1)
-            [ -n "$first" ] && sed -n "$((first>25 ? first-25 : 1)),$((first+15))p" build.log
-            echo "----- last 250 lines -----"
-            tail -250 build.log
-            exit 1;
-          }
+            -sdk iphoneos -arch arm64 -configuration Release 2>&1 | tee build.log | tail -5
+          if grep -q "ARCHIVE SUCCEEDED" build.log; then exit 0; fi
+          echo "::error::archive failed"
+          echo ""
+          echo "================ ALL COMPILER DIAGNOSTICS (this is the section the web log truncates) ================"
+          grep -nE "error:|warning: .*deprecated|fatal error|note: " build.log | grep -vE "Falling back to ad hoc|umbrella header|Run script build phase" | tail -200
+          echo ""
+          echo "================ CONTEXT AROUND EACH ERROR (25 before / 15 after) ================"
+          for first in $(grep -nE "error:|fatal error" build.log | grep -v "ARCHIVE FAILED" | cut -d: -f1 | head -6); do
+            echo "----- error at build.log line $first -----"
+            sed -n "$((first>25 ? first-25 : 1)),$((first+15))p" build.log
+          done
+          echo ""
+          echo "================ SWIFT FRONTEND INVOCATIONS THAT FAILED ================"
+          grep -B2 -A2 "SwiftCompile.*failed\|SwiftDriver.*failed" build.log | head -40
+          echo ""
+          echo "================ LAST 300 LINES OF RAW LOG ================"
+          tail -300 build.log
+          exit 1
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            build.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Sign for the VPN (ldid)
         run: |
