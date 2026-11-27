@@ -1,0 +1,393 @@
+diff --git a/LiveContainer/LCSharedUtils.m b/LiveContainer/LCSharedUtils.m
+index 3552c8c..22dcc4f 100644
+--- a/LiveContainer/LCSharedUtils.m
++++ b/LiveContainer/LCSharedUtils.m
+@@ -2,6 +2,7 @@
+ #import "FoundationPrivate.h"
+ #import "UIKitPrivate.h"
+ #import "utils.h"
++#import <dlfcn.h>
+ @import MachO;
+ 
+ extern NSUserDefaults *lcUserDefaults;
+@@ -11,6 +12,19 @@ extern NSBundle *lcMainBundle;
+ NSString* FBSOpenApplicationOptionKeyActivateAsClassic = @"__ActivateAsClassic";
+ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
+ 
++@interface LCVPNConnection : NSObject
++// An NEVPNStatus: 2 is connecting, 3 connected, 4 reasserting.
++@property(readonly) NSInteger status;
++- (BOOL)startVPNTunnelAndReturnError:(NSError **)error;
++@end
++@interface LCVPNManager : NSObject
++@property(getter=isEnabled) BOOL enabled;
++@property(readonly) LCVPNConnection *connection;
+++ (void)loadAllFromPreferencesWithCompletionHandler:(void (^)(NSArray *managers, NSError *error))completionHandler;
++- (void)saveToPreferencesWithCompletionHandler:(void (^)(NSError *error))completionHandler;
++- (void)loadFromPreferencesWithCompletionHandler:(void (^)(NSError *error))completionHandler;
++@end
++
+ @implementation LCSharedUtils
+ 
+ + (NSString*) teamIdentifier {
+@@ -397,14 +411,57 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
+     return infoDict[@"LCDataUUID"];
+ }
+ 
+-// The degenerate core-only form: no LoopbackVPN target exists in this build
+-// (the optional stage adds it), so there is nothing to start. The UI patch's
+-// FlekLoopbackVPN.isAvailable reads the extension's absence and routes the
+-// setup through LocalDevVPN, and the helper's waitForVPN flag stays unset.
+ + (void)startBuiltInVPNWithCompletionHandler:(void (^)(BOOL requested))completionHandler {
+-    if (completionHandler) completionHandler(NO);
++    void (^finish)(BOOL) = ^(BOOL requested) {
++        if(completionHandler) completionHandler(requested);
++    };
++    // Set by Settings once the user has allowed the VPN configuration. Without
++    // it there is nothing to start, and no reason to load the framework.
++    if(![NSUserDefaults.lcSharedDefaults boolForKey:@"LCBuiltInVPNConfigured"]) {
++        finish(NO);
++        return;
++    }
++    // Written before anything else, as the guest reads it to tell its helper
++    // that the VPN is on its way up and worth waiting a moment for.
++    [NSUserDefaults.lcSharedDefaults setObject:NSDate.date forKey:@"LCBuiltInVPNStartRequested"];
++    
++    dlopen("/System/Library/Frameworks/NetworkExtension.framework/NetworkExtension", RTLD_LAZY);
++    Class managerClass = NSClassFromString(@"NETunnelProviderManager");
++    if(!managerClass) {
++        finish(NO);
++        return;
++    }
++    [managerClass loadAllFromPreferencesWithCompletionHandler:^(NSArray *managers, NSError *error) {
++        // An app is only ever given its own configurations, and FlekDeck has one.
++        LCVPNManager *manager = managers.firstObject;
++        if(!manager) {
++            finish(NO);
++            return;
++        }
++        void (^start)(void) = ^{
++            NSInteger status = manager.connection.status;
++            if(status >= 2 && status <= 4) {
++                finish(YES);
++                return;
++            }
++            finish([manager.connection startVPNTunnelAndReturnError:nil]);
++        };
++        if(manager.isEnabled) {
++            start();
++            return;
++        }
++        // Another VPN has been chosen in Settings since, and iOS only starts
++        // the chosen one.
++        manager.enabled = YES;
++        [manager saveToPreferencesWithCompletionHandler:^(NSError *saveError) {
++            [manager loadFromPreferencesWithCompletionHandler:^(NSError *loadError) {
++                start();
++            }];
++        }];
++    }];
+ }
+ 
++
+ + (NSArray<NSString*>*)lcUnorderedUrlSchemes {
+     NSArray<NSString *> *defaultSchemes = @[@"livecontainer", @"livecontainer2", @"livecontainer3"];
+     return defaultSchemes;
+diff --git a/LiveContainerSwiftUI/FlekDeckJIT/FlekLoopbackVPN.swift b/LiveContainerSwiftUI/FlekDeckJIT/FlekLoopbackVPN.swift
+new file mode 100644
+index 0000000..2279362
+--- /dev/null
++++ b/LiveContainerSwiftUI/FlekDeckJIT/FlekLoopbackVPN.swift
+@@ -0,0 +1,155 @@
++//
++//  FlekLoopbackVPN.swift
++//  LiveContainerSwiftUI
++//
++//  The app's side of FlekDeck's own VPN, the one built-in JIT connects through;
++//  LoopbackTunnelProvider says what the VPN does and why JIT needs it. Here are
++//  the configuration iOS asks the user to allow, and turning the VPN on and off
++//  from Settings.
++//
++//  A guest's launch turns it on without any of this, through
++//  LCSharedUtils.startBuiltInVPN, which goes by the flag kept here.
++//
++
++@preconcurrency import NetworkExtension
++
++/// What an executable of this app was last signed with.
++enum FlekSignature {
++    /// Nil where the signature could not be read, which rules nothing out: a
++    /// Simulator build keeps its entitlements elsewhere.
++    static func entitlements(ofExecutableAt path: String) -> [String: Any]? {
++        guard let xml = getExecutableEntitlementXML(path) else {
++            return nil
++        }
++        return try? PropertyListSerialization.propertyList(from: Data(xml.utf8), format: nil) as? [String: Any]
++    }
++}
++
++@MainActor
++final class FlekLoopbackVPN: ObservableObject {
++    static let shared = FlekLoopbackVPN()
++
++    /// Whether this copy of FlekDeck can provide the VPN at all. It takes the
++    /// extension, which some installers leave out, and the Network Extensions
++    /// entitlement on both the app and the extension, which is up to whatever
++    /// signed this copy. Read once: none of it changes while the app runs.
++    static let isAvailable: Bool = {
++#if targetEnvironment(simulator)
++        return false
++#else
++        guard let tunnel = extensionBundle?.executablePath, let app = Bundle.main.executablePath else {
++            return false
++        }
++        return [app, tunnel].allSatisfy { executable in
++            guard let entitlements = FlekSignature.entitlements(ofExecutableAt: executable) else {
++                return true
++            }
++            let providers = entitlements["com.apple.developer.networking.networkextension"] as? [String]
++            return providers?.contains("packet-tunnel-provider") == true
++        }
++#endif
++    }()
++
++    /// Read from the bundle: a re-signed copy has its own bundle IDs.
++    private static var extensionBundle: Bundle? {
++        Bundle.main.builtInPlugInsURL.flatMap { Bundle(url: $0.appendingPathComponent("LoopbackVPN.appex")) }
++    }
++
++    /// Whether the user has allowed the VPN configuration.
++    @Published private(set) var isConfigured = false
++    @Published private(set) var status = NEVPNStatus.invalid
++
++    private var manager: NETunnelProviderManager?
++    private var statusObserver: NSObjectProtocol?
++
++    /// On, or on its way there.
++    var isOn: Bool {
++        status == .connected || status == .connecting || status == .reasserting
++    }
++
++    /// Finds the configuration again: it is kept by iOS, not by the app.
++    func refresh() async {
++        // An app is only ever given its own configurations, and FlekDeck has
++        // the one.
++        adopt((try? await NETunnelProviderManager.loadAllFromPreferences())?.first)
++    }
++
++    /// Adds the configuration, which is when iOS asks the user to allow it.
++    func setUp() async throws {
++        guard let provider = Self.extensionBundle?.bundleIdentifier else {
++            throw "lc.flek.jit.vpn.didNotStart".loc
++        }
++        let manager = try await NETunnelProviderManager.loadAllFromPreferences().first ?? NETunnelProviderManager()
++        let tunnel = NETunnelProviderProtocol()
++        tunnel.providerBundleIdentifier = provider
++        // Shown in Settings where another VPN names its server.
++        tunnel.serverAddress = "lc.flek.jit.vpn.server".loc
++        manager.protocolConfiguration = tunnel
++        // The name it goes by in the Settings app, among other apps' VPNs.
++        manager.localizedDescription = "LiveContainer"
++        manager.isEnabled = true
++        try await manager.saveToPreferences()
++        // What was saved cannot be started until it has been read back.
++        try await manager.loadFromPreferences()
++        adopt(manager)
++    }
++
++    /// Turns the VPN on and returns once it is up.
++    func connect() async throws {
++        guard let manager else {
++            throw "lc.flek.jit.vpn.didNotStart".loc
++        }
++        if !manager.isEnabled {
++            // Another VPN has been chosen in Settings since, and iOS only
++            // starts the chosen one.
++            manager.isEnabled = true
++            try await manager.saveToPreferences()
++            try await manager.loadFromPreferences()
++        }
++        if manager.connection.status != .connected {
++            try manager.connection.startVPNTunnel()
++        }
++        // It is up within a second as a rule.
++        for _ in 0..<50 where manager.connection.status != .connected {
++            try await Task.sleep(nanoseconds: 100_000_000)
++        }
++        status = manager.connection.status
++        guard status == .connected else {
++            throw "lc.flek.jit.vpn.didNotStart".loc
++        }
++    }
++
++    func disconnect() {
++        manager?.connection.stopVPNTunnel()
++    }
++
++    func remove() async throws {
++        try await manager?.removeFromPreferences()
++        adopt(nil)
++    }
++
++    private func adopt(_ manager: NETunnelProviderManager?) {
++        if let statusObserver {
++            NotificationCenter.default.removeObserver(statusObserver)
++        }
++        statusObserver = nil
++        self.manager = manager
++        isConfigured = manager != nil
++        status = manager?.connection.status ?? .invalid
++        // What a guest's launch goes by when it turns the VPN on.
++        LCUtils.appGroupUserDefault.set(isConfigured, forKey: "LCBuiltInVPNConfigured")
++        guard let manager else {
++            return
++        }
++        statusObserver = NotificationCenter.default.addObserver(
++            forName: .NEVPNStatusDidChange, object: manager.connection, queue: .main
++        ) { [weak self] notification in
++            guard let status = (notification.object as? NEVPNConnection)?.status else {
++                return
++            }
++            Task { @MainActor in
++                self?.status = status
++            }
++        }
++    }
++}
+diff --git a/LoopbackVPN/Info.plist b/LoopbackVPN/Info.plist
+new file mode 100644
+index 0000000..baf2a00
+--- /dev/null
++++ b/LoopbackVPN/Info.plist
+@@ -0,0 +1,29 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<key>CFBundleDisplayName</key>
++	<string>FlekDeck</string>
++	<key>CFBundleExecutable</key>
++	<string>$(EXECUTABLE_NAME)</string>
++	<key>CFBundleIdentifier</key>
++	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
++	<key>CFBundleInfoDictionaryVersion</key>
++	<string>6.0</string>
++	<key>CFBundleName</key>
++	<string>$(PRODUCT_NAME)</string>
++	<key>CFBundlePackageType</key>
++	<string>XPC!</string>
++	<key>CFBundleShortVersionString</key>
++	<string>$(MARKETING_VERSION)</string>
++	<key>CFBundleVersion</key>
++	<string>$(CURRENT_PROJECT_VERSION)</string>
++	<key>NSExtension</key>
++	<dict>
++		<key>NSExtensionPointIdentifier</key>
++		<string>com.apple.networkextension.packet-tunnel</string>
++		<key>NSExtensionPrincipalClass</key>
++		<string>$(PRODUCT_MODULE_NAME).LoopbackTunnelProvider</string>
++	</dict>
++</dict>
++</plist>
+diff --git a/LoopbackVPN/LoopbackTunnelProvider.swift b/LoopbackVPN/LoopbackTunnelProvider.swift
+new file mode 100644
+index 0000000..5e15088
+--- /dev/null
++++ b/LoopbackVPN/LoopbackTunnelProvider.swift
+@@ -0,0 +1,80 @@
++//
++//  LoopbackTunnelProvider.swift
++//  LoopbackVPN
++//
++//  A VPN that leads nowhere but back to this device. Built-in JIT needs it:
++//  iOS's debug service only takes a connection that arrives from somewhere
++//  else, never one from the device itself, and what arrives through this
++//  tunnel looks like it came from another machine.
++//
++//  The tunnel carries only what is sent to its peer address. Every packet read
++//  from it is written straight back with its source and destination swapped: a
++//  packet from this device to the peer returns as one from the peer to this
++//  device, so the two ends of the connection are both here. Nothing leaves the
++//  device and no other traffic is routed through it.
++//
++//  This is the approach of LocalDevVPN (formerly StosVPN), whose addresses are
++//  kept so that either works with the same tools.
++//
++
++import NetworkExtension
++
++final class LoopbackTunnelProvider: NEPacketTunnelProvider {
++    /// This device's address on the tunnel.
++    private static let interfaceAddress = "10.7.0.0"
++    /// The address that stands for this device as seen from outside, and the
++    /// one built-in JIT connects to.
++    private static let peerAddress = "10.7.0.1"
++
++    override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
++        let ipv4 = NEIPv4Settings(addresses: [Self.interfaceAddress], subnetMasks: ["255.255.255.0"])
++        // Only the peer goes through the tunnel; everything else keeps the
++        // route it had.
++        ipv4.includedRoutes = [NEIPv4Route(destinationAddress: Self.peerAddress, subnetMask: "255.255.255.255")]
++        ipv4.excludedRoutes = [NEIPv4Route.default()]
++
++        // The remote address is what Settings shows; it plays no part in routing.
++        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: Self.peerAddress)
++        settings.ipv4Settings = ipv4
++
++        setTunnelNetworkSettings(settings) { [weak self] error in
++            if error == nil {
++                self?.reflectPackets()
++            }
++            completionHandler(error)
++        }
++    }
++
++    override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
++        completionHandler()
++    }
++
++    /// Hands back whatever comes in, turned around, for as long as the tunnel
++    /// is up: the read is asked for again from its own completion.
++    private func reflectPackets() {
++        packetFlow.readPackets { [weak self] packets, protocols in
++            guard let self else { return }
++            let reflected = zip(packets, protocols).map { packet, family in
++                family.int32Value == AF_INET ? Self.swappingAddresses(of: packet) : packet
++            }
++            self.packetFlow.writePackets(reflected, withProtocols: protocols)
++            self.reflectPackets()
++        }
++    }
++
++    /// An IPv4 header holds its source address in bytes 12 to 15 and its
++    /// destination in 16 to 19. Both checksums cover the two addresses as a
++    /// sum, so exchanging them leaves the checksums valid.
++    private static func swappingAddresses(of packet: Data) -> Data {
++        guard packet.count >= 20 else {
++            return packet
++        }
++        var packet = packet
++        packet.withUnsafeMutableBytes { bytes in
++            for offset in 12..<16 {
++                bytes.swapAt(offset, offset + 4)
++            }
++        }
++        return packet
++    }
++}
+diff --git a/LoopbackVPN/LoopbackVPN.entitlements b/LoopbackVPN/LoopbackVPN.entitlements
+new file mode 100644
+index 0000000..ffab33e
+--- /dev/null
++++ b/LoopbackVPN/LoopbackVPN.entitlements
+@@ -0,0 +1,10 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<key>com.apple.developer.networking.networkextension</key>
++	<array>
++		<string>packet-tunnel-provider</string>
++	</array>
++</dict>
++</plist>
