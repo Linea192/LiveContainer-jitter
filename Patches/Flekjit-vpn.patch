@@ -1,5 +1,5 @@
 diff --git a/LiveContainer/LCSharedUtils.m b/LiveContainer/LCSharedUtils.m
-index 3552c8c..22dcc4f 100644
+index 14e9510..0819c8f 100644
 --- a/LiveContainer/LCSharedUtils.m
 +++ b/LiveContainer/LCSharedUtils.m
 @@ -2,6 +2,7 @@
@@ -30,8 +30,8 @@ index 3552c8c..22dcc4f 100644
  @implementation LCSharedUtils
  
  + (NSString*) teamIdentifier {
-@@ -397,14 +411,57 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
-     return infoDict[@"LCDataUUID"];
+@@ -421,14 +435,57 @@ NSString* FBSOpenApplicationOptionKeyPayloadURL = @"__PayloadURL";
+     return nil;
  }
  
 -// The degenerate core-only form: no LoopbackVPN target exists in this build
